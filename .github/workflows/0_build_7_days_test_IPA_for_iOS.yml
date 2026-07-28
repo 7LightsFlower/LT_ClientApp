@@ -13,6 +13,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 👇 Add this step to set Xcode 16.2 (or 16.1 / 16.0)
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.2'
+
       - uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
