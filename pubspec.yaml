@@ -34,7 +34,6 @@ dev_dependencies:
   flutter_lints: ^3.0.0
 
 flutter:
-#  disable-swift-package-manager: true
   uses-material-design: true
   assets:
     - assets/fonts/NotoSans-Regular.ttf

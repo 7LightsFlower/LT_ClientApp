@@ -25,6 +25,9 @@ jobs:
           mkdir -p build/ios/SourcePackages
           mkdir -p build/macos/SourcePackages
 
+      - name: Disable Swift Package Manager
+        run: flutter config --no-enable-swift-package-manager
+
       - run: flutter pub get
 
       # --- Patch Podfile ---
