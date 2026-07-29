@@ -143,6 +143,16 @@ jobs:
           CODE_SIGN_IDENTITY: ""
         run: flutter build ios --release --no-codesign
 
+      - name: Force copy GoogleService-Info.plist into Runner.app
+        run: |
+          if [ -f "ios/Runner/GoogleService-Info.plist" ]; then
+            cp ios/Runner/GoogleService-Info.plist build/ios/iphoneos/Runner.app/
+            echo "✅ GoogleService-Info.plist successfully copied to Runner.app"
+          else
+            echo "❌ ERROR: GoogleService-Info.plist not found in ios/Runner/"
+            exit 1
+          fi
+
       # --- Package IPA ---
       - name: Create Payload and IPA
         working-directory: build/ios/iphoneos
