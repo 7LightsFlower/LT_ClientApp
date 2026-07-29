@@ -35,7 +35,15 @@ jobs:
         run: flutter config --no-enable-swift-package-manager
 
       - run: flutter pub get
-
+      
+      - name: Verify Bundle ID matches Firebase
+        run: |
+          echo "📱 Firebase expects:"
+          grep -o '<string>[^<]*</string>' ios/Runner/GoogleService-Info.plist | grep BUNDLE_ID -A1 | tail -1
+          
+          echo "📱 Xcode is building:"
+          grep "PRODUCT_BUNDLE_IDENTIFIER" ios/Runner.xcodeproj/project.pbxproj | head -2
+          
       # --- Patch Podfile ---
       - name: Replace post_install block in Podfile
         run: |
