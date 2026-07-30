@@ -216,27 +216,57 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
   }
 
   Widget _buildScannerUI() {
-    return Stack(
-      children: [
-        MobileScanner(
-          controller: scannerController!,
-          onDetect: _onScanComplete,
-        ),
-        const Align(
-          alignment: Alignment.bottomCenter,
-          child: Padding(
-            padding: EdgeInsets.all(24),
-            child: Text(
-              'Point camera at QR code or tap ✏️ to enter URL manually',
-              style: TextStyle(
-                color: Colors.white,
-                backgroundColor: Colors.black54,
-              ),
-              textAlign: TextAlign.center,
+    // Ensure the controller is not null (it should be when _cameraSupported is true)
+    final controller = scannerController;
+    if (controller == null) {
+      // Fallback: show manual entry if controller is null
+      return _buildManualEntryScreen();
+    }
+
+    return Scaffold(
+      body: MobileScanner(
+        controller: controller,
+        onDetect: _onScanComplete,
+        errorBuilder: (context, error) {
+          // This callback is called when the camera fails.
+          // Show error and offer manual entry fallback.
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Camera error: $error'),
+                  backgroundColor: Colors.red,
+                ),
+              );
+            }
+          });
+          return Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(Icons.error_outline, size: 60, color: Colors.red),
+                const SizedBox(height: 16),
+                Text(
+                  'Camera error: $error',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.grey),
+                ),
+                const SizedBox(height: 24),
+                ElevatedButton.icon(
+                  onPressed: _showManualEntryDialog,
+                  icon: const Icon(Icons.edit),
+                  label: const Text('Enter URL manually'),
+                ),
+              ],
             ),
-          ),
-        ),
-      ],
+          );
+        },
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _showManualEntryDialog,
+        icon: const Icon(Icons.edit),
+        label: const Text('Enter URL manually'),
+      ),
     );
   }
 
