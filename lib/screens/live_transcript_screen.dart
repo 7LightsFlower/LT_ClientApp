@@ -12,9 +12,9 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../models/transcript_message.dart';
 
-// Web-only import for window.open (simple fallback)
-// ignore: avoid_web_libraries_in_flutter
-import 'dart:html' as html;
+
+import 'package:asr_live_translator/web_stub.dart'
+    if (dart.library.html) 'dart:html' as html;
 
 class LiveTranscriptScreen extends StatefulWidget {
   final String resolvedUrl;

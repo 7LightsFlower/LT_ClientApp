@@ -8,7 +8,6 @@ import 'screens/silent_auth_screen.dart';
 import 'route_observer.dart';
 
 import 'package:webview_flutter/webview_flutter.dart';
-import 'package:webview_flutter_web/webview_flutter_web.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -76,11 +75,6 @@ void main() async {
         ),
       ),
     );
-  }
-
-  // ✅ Register web platform before runApp
-  if (kIsWeb) {
-    WebViewPlatform.instance = WebWebViewPlatform();
   }
 
   runApp(app);
