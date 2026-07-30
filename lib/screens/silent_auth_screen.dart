@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 
 class SilentAuthScreen extends StatefulWidget {
   final String originalUrl;
@@ -30,13 +31,11 @@ class _SilentAuthScreenState extends State<SilentAuthScreen> {
   }
 
   void _initializeWebView() {
-    _controller = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+    var controller = WebViewController()
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageFinished: (String url) async {
             setState(() => _isLoading = false);
-            // Try to extract cookies after the page loads
             await _checkCookies();
           },
           onWebResourceError: (WebResourceError error) {
@@ -46,14 +45,18 @@ class _SilentAuthScreenState extends State<SilentAuthScreen> {
             });
           },
         ),
-      )
-      ..loadRequest(Uri.parse(widget.originalUrl));
+      );
+
+    // ✅ Only call on native platforms – web doesn't need this
+    if (!kIsWeb) {
+      controller = controller..setJavaScriptMode(JavaScriptMode.unrestricted);
+    }
+
+    _controller = controller..loadRequest(Uri.parse(widget.originalUrl));
   }
 
-  /// Extract cookies from the WebView using JavaScript.
   Future<void> _checkCookies() async {
     try {
-      // Use runJavaScriptReturningResult to get the cookie string
       final cookies = await _controller.runJavaScriptReturningResult(
         'document.cookie',
       ) as String?;
@@ -62,7 +65,6 @@ class _SilentAuthScreenState extends State<SilentAuthScreen> {
         await _secureStorage.write(key: 'cookies', value: cookies);
         debugPrint('🍪 Stored cookie: $cookies');
 
-        // Navigate to live transcript screen
         if (mounted) {
           Navigator.pushReplacementNamed(
             context,
@@ -74,7 +76,6 @@ class _SilentAuthScreenState extends State<SilentAuthScreen> {
           );
         }
       } else {
-        // No cookies yet – maybe the page hasn't set them
         setState(() {
           _errorMessage = 'No cookies found. Please try again or log in manually.';
         });

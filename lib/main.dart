@@ -1,5 +1,5 @@
 import 'package:asr_live_translator/screens/session_selection_screen.dart';
-import 'package:firebase_core/firebase_core.dart';  // ✅ correct
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, kDebugMode;
 import 'screens/qr_scanner_screen.dart';
@@ -7,13 +7,16 @@ import 'screens/live_transcript_screen.dart';
 import 'screens/silent_auth_screen.dart';
 import 'route_observer.dart';
 
+import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_flutter_web/webview_flutter_web.dart';
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   Widget app;
 
   try {
-    // ---- Firebase initialization ----.
+    // ---- Firebase initialization ----
     if (kIsWeb) {
       const firebaseOptions = FirebaseOptions(
         apiKey: "AIzaSyDzSrmUy6SB2mSj0IZ3lOIJZ4de5fmps4w",
@@ -41,16 +44,12 @@ void main() async {
       await Firebase.initializeApp(options: firebaseOptions);
     }
 
-    // If we reach here, initialization succeeded.
     app = const MyApp();
   } catch (e, stack) {
-    // Log the full error to console (visible in Xcode logs)
     if (kDebugMode) {
       print('🔥 Firebase init failed: $e');
       print(stack);
     }
-
-    // Show a friendly error screen so you know what went wrong.
     app = MaterialApp(
       home: Scaffold(
         body: Center(
@@ -79,9 +78,14 @@ void main() async {
     );
   }
 
+  // ✅ Register web platform before runApp
+  if (kIsWeb) {
+    WebViewPlatform.instance = WebWebViewPlatform();
+  }
+
   runApp(app);
 }
-  
+
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
