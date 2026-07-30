@@ -152,6 +152,9 @@ jobs:
             echo "❌ ERROR: GoogleService-Info.plist not found in ios/Runner/"
             exit 1
           fi
+      - name: Verify camera permission in Info.plist
+        run: |
+          /usr/libexec/PlistBuddy -c "Print :NSCameraUsageDescription" build/ios/iphoneos/Runner.app/Info.plist
 
       # --- Package IPA ---
       - name: Create Payload and IPA
