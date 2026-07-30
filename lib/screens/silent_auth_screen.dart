@@ -36,8 +36,8 @@ class _SilentAuthScreenState extends State<SilentAuthScreen> {
         NavigationDelegate(
           onPageFinished: (String url) async {
             setState(() => _isLoading = false);
-            // Try to extract cookies after page loads
-            await _checkCookies(url);
+            // Try to extract cookies after the page loads
+            await _checkCookies();
           },
           onWebResourceError: (WebResourceError error) {
             setState(() {
@@ -50,15 +50,15 @@ class _SilentAuthScreenState extends State<SilentAuthScreen> {
       ..loadRequest(Uri.parse(widget.originalUrl));
   }
 
-  /// Extract cookies from the WebView and store them, then proceed.
-  Future<void> _checkCookies(String url) async {
+  /// Extract cookies from the WebView using JavaScript.
+  Future<void> _checkCookies() async {
     try {
-      // webview_flutter doesn't have a direct getCookies method,
-      // but we can use javascript to get document.cookie.
-      final cookies = await _controller.runJavaScriptReturningString(
+      // Use runJavaScriptReturningResult to get the cookie string
+      final cookies = await _controller.runJavaScriptReturningResult(
         'document.cookie',
-      );
-      if (cookies.isNotEmpty) {
+      ) as String?;
+
+      if (cookies != null && cookies.isNotEmpty) {
         await _secureStorage.write(key: 'cookies', value: cookies);
         debugPrint('🍪 Stored cookie: $cookies');
 
@@ -73,11 +73,14 @@ class _SilentAuthScreenState extends State<SilentAuthScreen> {
             },
           );
         }
+      } else {
+        // No cookies yet – maybe the page hasn't set them
+        setState(() {
+          _errorMessage = 'No cookies found. Please try again or log in manually.';
+        });
       }
     } catch (e) {
       debugPrint('⚠️ Failed to read cookies: $e');
-      // If cookies not available yet, wait a bit and retry (or let user retry)
-      // For simplicity, we show a retry button.
       setState(() {
         _errorMessage = 'Could not retrieve authentication cookies. Please try again.';
       });
