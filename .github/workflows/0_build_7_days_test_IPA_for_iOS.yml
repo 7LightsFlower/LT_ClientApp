@@ -35,7 +35,15 @@ jobs:
         run: flutter config --no-enable-swift-package-manager
 
       - run: flutter pub get
-
+      
+      - name: Verify Bundle ID matches Firebase
+        run: |
+          echo "📱 Firebase expects:"
+          grep -o '<string>[^<]*</string>' ios/Runner/GoogleService-Info.plist | grep BUNDLE_ID -A1 | tail -1
+          
+          echo "📱 Xcode is building:"
+          grep "PRODUCT_BUNDLE_IDENTIFIER" ios/Runner.xcodeproj/project.pbxproj | head -2
+          
       # --- Patch Podfile ---
       - name: Replace post_install block in Podfile
         run: |
@@ -134,6 +142,19 @@ jobs:
           CODE_SIGNING_ALLOWED: "NO"
           CODE_SIGN_IDENTITY: ""
         run: flutter build ios --release --no-codesign
+
+      - name: Force copy GoogleService-Info.plist into Runner.app
+        run: |
+          if [ -f "ios/Runner/GoogleService-Info.plist" ]; then
+            cp ios/Runner/GoogleService-Info.plist build/ios/iphoneos/Runner.app/
+            echo "✅ GoogleService-Info.plist successfully copied to Runner.app"
+          else
+            echo "❌ ERROR: GoogleService-Info.plist not found in ios/Runner/"
+            exit 1
+          fi
+      - name: Verify camera permission in Info.plist
+        run: |
+          /usr/libexec/PlistBuddy -c "Print :NSCameraUsageDescription" build/ios/iphoneos/Runner.app/Info.plist
 
       # --- Package IPA ---
       - name: Create Payload and IPA
