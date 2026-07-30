@@ -12,7 +12,7 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../models/transcript_message.dart';
 
-
+// Conditional import: use dart:html on web, stub elsewhere
 import 'package:asr_live_translator/web_stub.dart'
     if (dart.library.html) 'dart:html' as html;
 
@@ -534,10 +534,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     final isUnstable = json['unstable'] == true;
     final start = json['start']?.toString() ?? '';
 
-    String transcriptText = '';
-    Uint8List? audioBytes;
-    String? audioUrl; // for web: original URL
-
     // ============================================================
     // TTS MESSAGE HANDLER
     // ============================================================
@@ -547,13 +543,39 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         debugPrint('⏭️ Skipping TTS with empty text');
         return;
       }
-      transcriptText = _cleanTranscript(text);
+      final transcriptText = _cleanTranscript(text);
 
+      // Extract language from sender
+      final langKey = sender.substring(4); // remove 'tts:'
+      String language;
+      if (_senderToLanguage != null && _senderToLanguage!.containsKey(langKey)) {
+        language = _senderToLanguage![langKey]!;
+      } else {
+        language = langKey; // fallback: use the stripped string as language name
+      }
+
+      // Add language to available set
+      if (!language.contains('Audio') && !language.contains('Correction')) {
+        _availableLanguages.add(language);
+      }
+      if (!_defaultFilterSet && !language.contains('Audio') && !language.contains('Correction')) {
+        if (mounted) {
+          setState(() {
+            _selectedLanguage = null;
+            _defaultFilterSet = true;
+          });
+        }
+      }
+
+      // Audio fetching
+      Uint8List? audioBytes;
+      String? audioUrl;
       final audioUrlPath = json['b64_enc_pcm_s16le'] as String?;
       if (audioUrlPath != null) {
         try {
-          // Build full URL with query parameters
-          String fullUrl = audioUrlPath.startsWith('http') ? audioUrlPath : '$_baseUrl$audioUrlPath';
+          String fullUrl = audioUrlPath.startsWith('http')
+              ? audioUrlPath
+              : '$_baseUrl$audioUrlPath';
           final uri = Uri.parse(fullUrl);
           final params = Map<String, String>.from(uri.queryParameters);
           if (_sseSessionId != null) {
@@ -567,10 +589,9 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
           debugPrint('🎵 Audio URL: $fullUrl');
 
           if (kIsWeb) {
-            // Web: just store the URL (will be opened in new tab)
             audioUrl = fullUrl;
           } else {
-            // NON‑WEB: Use http.Client with manual cookie
+            // Non‑web: download and convert to WAV
             final headers = {
               ..._browserHeaders(),
               'Referer': _baseUrl!,
@@ -582,10 +603,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
             }
             if (cookieToSend != null && cookieToSend.isNotEmpty) {
               headers['Cookie'] = cookieToSend;
-              debugPrint('🍪 Sending cookie (non-web): $cookieToSend');
             } else if (_sseSessionId != null) {
               headers['Cookie'] = 'session=$_sseSessionId;';
-              debugPrint('🍪 Sending fallback cookie (non-web): session=$_sseSessionId');
             }
 
             final response = await _httpClient.get(
@@ -606,30 +625,48 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         }
       }
 
-      // Store the message
-      const language = 'TTS';
-      _availableLanguages.add(language);
-      if (!_defaultFilterSet) {
-        if (mounted) {
-          setState(() {
-            _selectedLanguage = null;
-            _defaultFilterSet = true;
-          });
+      // Merge with existing transcript of same language and text
+      String key;
+      bool foundMatch = false;
+      final trimmedText = transcriptText.trim();
+      for (final entry in _messagesMap.entries) {
+        final msg = entry.value;
+        if (msg.language == language && msg.transcript.trim() == trimmedText) {
+          // Found matching transcript → attach audio to it
+          key = entry.key;
+          // Create a new message with the same data plus the audio
+          final updatedMsg = TranscriptMessage(
+            transcript: msg.transcript,
+            translations: msg.translations,
+            timestamp: msg.timestamp,
+            language: msg.language,
+            isUnstable: msg.isUnstable,
+            audioData: audioBytes,
+            audioUrl: audioUrl,
+          );
+          _messagesMap[key] = updatedMsg;
+          foundMatch = true;
+          debugPrint('🔗 Attached TTS audio to existing transcript: $key');
+          break;
         }
       }
 
-      final key = 'tts_${json['message_id'] ?? DateTime.now().millisecondsSinceEpoch}';
+      if (!foundMatch) {
+        // No match → create a new message with the correct language
+        key = 'tts_${json['message_id'] ?? DateTime.now().millisecondsSinceEpoch}';
+        _messagesMap[key] = TranscriptMessage(
+          transcript: transcriptText,
+          translations: {},
+          timestamp: DateTime.now(),
+          language: language,
+          isUnstable: false,
+          audioData: audioBytes,
+          audioUrl: audioUrl,
+        );
+        debugPrint('🆕 Created new TTS message with language: $language');
+      }
 
-      _messagesMap[key] = TranscriptMessage(
-        transcript: transcriptText,
-        translations: {},
-        timestamp: DateTime.now(),
-        language: language,
-        isUnstable: isUnstable,
-        audioData: audioBytes,
-        audioUrl: audioUrl,
-      );
-
+      // Save to Firestore (optional)
       if (_transcriptsRef != null) {
         try {
           await _transcriptsRef!.add({
@@ -637,7 +674,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
             'translations': {},
             'timestamp': Timestamp.fromDate(DateTime.now()),
             'language': language,
-            'isUnstable': isUnstable,
+            'isUnstable': false,
           });
         } catch (e) {
           debugPrint('⚠️ Could not save to Firestore: $e');
@@ -656,7 +693,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     // ============================================================
     // NON-TTS MESSAGE
     // ============================================================
-    transcriptText = (json['text'] ?? json['seq'] ?? '').toString().trim();
+    String transcriptText = (json['text'] ?? json['seq'] ?? '').toString().trim();
     transcriptText = _cleanTranscript(transcriptText);
     if (transcriptText.isEmpty) {
       debugPrint('⏭️ Skipping message with empty text/seq');
