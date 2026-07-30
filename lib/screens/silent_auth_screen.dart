@@ -1,8 +1,7 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart' show kDebugMode;
-import 'package:webview_windows/webview_windows.dart';
+import 'package:webview_flutter/webview_flutter.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'live_transcript_screen.dart';
 
 class SilentAuthScreen extends StatefulWidget {
   final String originalUrl;
@@ -19,158 +18,119 @@ class SilentAuthScreen extends StatefulWidget {
 }
 
 class _SilentAuthScreenState extends State<SilentAuthScreen> {
-  WebviewController? _controller;
+  late final WebViewController _controller;
   bool _isLoading = true;
-  bool _isAuthenticated = false;
   String? _errorMessage;
-  final FlutterSecureStorage _storage = const FlutterSecureStorage();
+  final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
 
   @override
   void initState() {
     super.initState();
-    _initWebView();
+    _initializeWebView();
   }
 
-  // 👇 Cancel authentication and go back to session list
-  void _cancelAuth() {
-    _controller?.dispose();
-    if (mounted) {
-      // Navigate back to the session list (root)
-      Navigator.pushReplacementNamed(context, '/');
-    }
+  void _initializeWebView() {
+    _controller = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onPageFinished: (String url) async {
+            setState(() => _isLoading = false);
+            // Try to extract cookies after page loads
+            await _checkCookies(url);
+          },
+          onWebResourceError: (WebResourceError error) {
+            setState(() {
+              _isLoading = false;
+              _errorMessage = 'Failed to load page: ${error.description}';
+            });
+          },
+        ),
+      )
+      ..loadRequest(Uri.parse(widget.originalUrl));
   }
 
-  Future<void> _initWebView() async {
+  /// Extract cookies from the WebView and store them, then proceed.
+  Future<void> _checkCookies(String url) async {
     try {
-      if (kDebugMode) print('Initializing WebView...');
-      final controller = WebviewController();
-      await controller.initialize();
-      if (kDebugMode) print('WebView initialized successfully.');
+      // webview_flutter doesn't have a direct getCookies method,
+      // but we can use javascript to get document.cookie.
+      final cookies = await _controller.runJavaScriptReturningString(
+        'document.cookie',
+      );
+      if (cookies.isNotEmpty) {
+        await _secureStorage.write(key: 'cookies', value: cookies);
+        debugPrint('🍪 Stored cookie: $cookies');
 
-      await controller.loadUrl(widget.originalUrl);
-      if (kDebugMode) print('Loaded URL: ${widget.originalUrl}');
-
-      if (mounted) {
-        setState(() {
-          _controller = controller;
-          _isLoading = false;
-        });
-        // Start checking cookies periodically
-        _checkCookies(controller);
-      }
-    } catch (e) {
-      if (kDebugMode) print('WebView init error: $e');
-      if (mounted) {
-        setState(() {
-          _isLoading = false;
-          _errorMessage = 'Failed to initialize WebView: ${e.toString()}';
-        });
-      }
-    }
-  }
-
-  Future<void> _checkCookies(WebviewController controller) async {
-    if (_isAuthenticated || !mounted) return;
-
-    try {
-      final cookies = await controller.executeScript('document.cookie');
-      if (kDebugMode) print('Cookies: $cookies');
-
-      if (cookies != null && cookies.isNotEmpty && cookies.contains('_forward_auth_csrf')) {
-        await _storage.write(key: 'cookies', value: cookies);
-        if (mounted && !_isAuthenticated) {
-          setState(() => _isAuthenticated = true);
-          Navigator.pushReplacement(
+        // Navigate to live transcript screen
+        if (mounted) {
+          Navigator.pushReplacementNamed(
             context,
-            MaterialPageRoute(
-              builder: (_) => LiveTranscriptScreen(
-                resolvedUrl: widget.resolvedUrl,
-                originalUrl: widget.originalUrl,
-              ),
-            ),
+            '/live',
+            arguments: {
+              'resolvedUrl': widget.resolvedUrl,
+              'originalUrl': widget.originalUrl,
+            },
           );
         }
-      } else {
-        // Check again after 3 seconds
-        Future.delayed(const Duration(seconds: 3), () {
-          if (mounted && !_isAuthenticated) {
-            _checkCookies(controller);
-          }
-        });
       }
     } catch (e) {
-      if (kDebugMode) print('Error extracting cookies: $e');
-      Future.delayed(const Duration(seconds: 3), () {
-        if (mounted && !_isAuthenticated) {
-          _checkCookies(controller);
-        }
+      debugPrint('⚠️ Failed to read cookies: $e');
+      // If cookies not available yet, wait a bit and retry (or let user retry)
+      // For simplicity, we show a retry button.
+      setState(() {
+        _errorMessage = 'Could not retrieve authentication cookies. Please try again.';
       });
     }
   }
 
+  void _retry() {
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
+    _controller.reload();
+  }
+
   @override
   Widget build(BuildContext context) {
-    if (_errorMessage != null) {
-      return Scaffold(
-        appBar: AppBar(
-          title: const Text('Error'),
-          leading: IconButton(
-            icon: const Icon(Icons.close),
-            onPressed: _cancelAuth,
-            tooltip: 'Cancel',
-          ),
-        ),
-        body: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(16.0),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(Icons.error_outline, size: 64, color: Colors.red),
-                const SizedBox(height: 16),
-                Text(_errorMessage!,
-                    style: const TextStyle(fontSize: 16),
-                    textAlign: TextAlign.center),
-                const SizedBox(height: 24),
-                ElevatedButton(
-                  onPressed: () {
-                    setState(() {
-                      _errorMessage = null;
-                      _isLoading = true;
-                    });
-                    _initWebView();
-                  },
-                  child: const Text('Retry'),
-                ),
-                const SizedBox(height: 12),
-                TextButton(
-                  onPressed: _cancelAuth,
-                  child: const Text('Cancel'),
-                ),
-              ],
-            ),
-          ),
-        ),
-      );
-    }
-
     return Scaffold(
       appBar: AppBar(
         title: const Text('Authenticating…'),
-        // 👇 Add a cancel button on the left
-        leading: IconButton(
-          icon: const Icon(Icons.close),
-          onPressed: _cancelAuth,
-          tooltip: 'Cancel authentication',
-        ),
-        // Keep the back arrow optional – but we have our own close
-        automaticallyImplyLeading: false,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _retry,
+            tooltip: 'Retry',
+          ),
+        ],
       ),
-      body: _isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : _controller != null
-              ? Webview(_controller!)
-              : const Center(child: Text('Failed to load WebView')),
+      body: Column(
+        children: [
+          if (_isLoading) const LinearProgressIndicator(),
+          if (_errorMessage != null)
+            Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                children: [
+                  Text(
+                    _errorMessage!,
+                    style: const TextStyle(color: Colors.red),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 12),
+                  ElevatedButton(
+                    onPressed: _retry,
+                    child: const Text('Retry'),
+                  ),
+                ],
+              ),
+            ),
+          Expanded(
+            child: WebViewWidget(controller: _controller),
+          ),
+        ],
+      ),
     );
   }
 }
