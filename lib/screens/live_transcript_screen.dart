@@ -14,7 +14,7 @@ import '../models/transcript_message.dart';
 
 // Web-only import for window.open (simple fallback)
 // ignore: avoid_web_libraries_in_flutter
-import 'dart:html' as html;
+import 'dart:html' if (dart.library.html) 'dart:html' as html;
 
 class LiveTranscriptScreen extends StatefulWidget {
   final String resolvedUrl;
