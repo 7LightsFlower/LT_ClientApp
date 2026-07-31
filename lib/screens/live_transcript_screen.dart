@@ -31,6 +31,30 @@ class LiveTranscriptScreen extends StatefulWidget {
 }
 
 class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
+  // Built-in fallback for common language codes
+  static const Map<String, String> _languageCodeMap = {
+    'en': 'English',
+    'es': 'Spanish',
+    'fr': 'French',
+    'de': 'German',
+    'it': 'Italian',
+    'pt': 'Portuguese',
+    'ru': 'Russian',
+    'zh': 'Chinese',
+    'ja': 'Japanese',
+    'ko': 'Korean',
+    'ar': 'Arabic',
+    'hi': 'Hindi',
+    'nl': 'Dutch',
+    'pl': 'Polish',
+    'tr': 'Turkish',
+    'vi': 'Vietnamese',
+    'th': 'Thai',
+    'id': 'Indonesian',
+    'ms': 'Malay',
+    'fil': 'Filipino',
+  };
+
   String? _selectedLanguage;
   final Set<String> _availableLanguages = {};
   final Map<String, TranscriptMessage> _messagesMap = {};
@@ -503,6 +527,10 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     if (_senderToLanguage != null && _senderToLanguage!.containsKey(sender)) {
       return _senderToLanguage![sender]!;
     }
+    // Fallback: if sender is a language code (e.g., 'en'), use built-in map
+    if (_languageCodeMap.containsKey(sender)) {
+      return _languageCodeMap[sender]!;
+    }
     return sender;
   }
 
@@ -545,13 +573,17 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       }
       final transcriptText = _cleanTranscript(text);
 
-      // Extract language from sender
+      // Extract language from sender (e.g., 'tts:en' -> 'en')
       final langKey = sender.substring(4); // remove 'tts:'
       String language;
+      // First, check the mapping from the HTML page
       if (_senderToLanguage != null && _senderToLanguage!.containsKey(langKey)) {
         language = _senderToLanguage![langKey]!;
+      } else if (_languageCodeMap.containsKey(langKey)) {
+        // Fallback to built‑in map
+        language = _languageCodeMap[langKey]!;
       } else {
-        language = langKey; // fallback: use the stripped string as language name
+        language = langKey; // keep as is
       }
 
       // Add language to available set
@@ -863,14 +895,13 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
             if (_availableLanguages.isNotEmpty)
               DropdownButton<String>(
                 value: _selectedLanguage,
-                hint: const Text('All'),
-                items: [
-                  const DropdownMenuItem<String>(value: null, child: Text('All (transcript)')),
-                  ..._availableLanguages.map((lang) => DropdownMenuItem<String>(
+                hint: const Text('All'), // Show 'All' when nothing selected
+                items: _availableLanguages.map((lang) {
+                  return DropdownMenuItem<String>(
                     value: lang,
                     child: Text(lang),
-                  )),
-                ],
+                  );
+                }).toList(),
                 onChanged: (newLang) => setState(() => _selectedLanguage = newLang),
               ),
             // Manual cookie override (for non‑web debugging)
