@@ -153,6 +153,39 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     return wavBytes;
   }
 
+  /// /webapi/stream/data answers with JSON that carries the audio as base64
+  /// 16-bit PCM. Accepts a bare JSON string or an object with the data in a
+  /// field; falls back to raw PCM if the answer isn't JSON.
+  ({Uint8List pcm, int? sampleRate}) _decodeAudioResponse(http.Response response) {
+    final type = response.headers['content-type'] ?? '';
+    if (!type.contains('json')) {
+      return (pcm: response.bodyBytes, sampleRate: null);
+    }
+
+    final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+    String? b64;
+    int? rate;
+    if (decoded is String) {
+      b64 = decoded;
+    } else if (decoded is Map) {
+      debugPrint('🎧 Audio JSON keys: ${decoded.keys.toList()}');
+      final known = decoded['b64_enc_pcm_s16le'] ?? decoded['data'] ?? decoded['audio'];
+      if (known is String) b64 = known;
+      // Otherwise take the longest text value – that's the audio.
+      b64 ??= decoded.values.whereType<String>().fold<String?>(
+          null, (best, s) => best == null || s.length > best.length ? s : best);
+      final r = decoded['sample_rate'] ?? decoded['sampleRate'] ?? decoded['sr'];
+      if (r is num) rate = r.toInt();
+    }
+    if (b64 == null || b64.isEmpty) {
+      throw const FormatException('No audio data found in the JSON answer');
+    }
+    if (b64.startsWith('data:') && b64.contains(',')) {
+      b64 = b64.substring(b64.indexOf(',') + 1);
+    }
+    return (pcm: base64Decode(base64.normalize(b64.trim())), sampleRate: rate);
+  }
+
   @override
   void initState() {
     super.initState();
@@ -736,34 +769,26 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
           debugPrint('❌ Could not decode inline audio: $e');
         }
       } else if (audioField != null && audioField.isNotEmpty) {
-        // Use the audio link exactly as the server sends it. The extra
-        // session/sid/channel/token/stream parameters we used to add made
-        // the server ask for a login.
-        final fullUrl = audioField.startsWith('http') ? audioField : '$_baseUrl$audioField';
+        // The message links audio under /ltapi/ (internal, needs login).
+        // The public web page fetches the same data under /webapi/ – no login.
+        final path = audioField.replaceFirst('/ltapi/', '/webapi/');
+        final fullUrl = path.startsWith('http') ? path : '$_baseUrl$path';
         debugPrint('🎵 Audio URL: $fullUrl');
         try {
           final headers = _browserHeaders();
-          if (!kIsWeb) {
-            headers['Referer'] = _baseUrl!;
-            if (_cookieString != null && _cookieString!.isNotEmpty) {
-              headers['Cookie'] = _cookieString!;
-            }
-          }
+          if (!kIsWeb) headers['Referer'] = widget.originalUrl ?? _baseUrl!;
           final response = await _httpClient
               .get(Uri.parse(fullUrl), headers: headers)
               .timeout(const Duration(seconds: 15));
           if (response.statusCode == 200) {
-            // The server sends raw PCM, which no player can play directly,
-            // so wrap it in a WAV header (on web too).
-            audioBytes = _pcmToWav(response.bodyBytes, sampleRate: sampleRate);
-            debugPrint('✅ Downloaded audio: ${audioBytes.length} bytes');
+            final audio = _decodeAudioResponse(response);
+            audioBytes = _pcmToWav(audio.pcm, sampleRate: audio.sampleRate ?? sampleRate);
+            debugPrint('✅ Audio ready: ${audioBytes.length} bytes');
           } else {
-            audioUrl = fullUrl; // fallback: web opens the link in a tab
             debugPrint('❌ Failed to fetch audio: HTTP ${response.statusCode}');
           }
         } catch (e) {
-          audioUrl = fullUrl;
-          debugPrint('❌ Error downloading audio: $e');
+          debugPrint('❌ Error loading audio: $e');
         }
       }
       // Merge with existing transcript of same language and text
