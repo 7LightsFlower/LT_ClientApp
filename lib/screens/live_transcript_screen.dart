@@ -11,6 +11,7 @@ import 'package:http/http.dart' as http;
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../models/transcript_message.dart';
+import '../cookie_utils.dart';
 
 // Conditional import: use dart:html on web, stub elsewhere
 import 'package:asr_live_translator/web_stub.dart'
@@ -20,10 +21,14 @@ class LiveTranscriptScreen extends StatefulWidget {
   final String resolvedUrl;
   final String? originalUrl;
 
+  /// True when we arrive from the auth screen; prevents an auth redirect loop.
+  final bool authAttempted;
+
   const LiveTranscriptScreen({
     super.key,
     required this.resolvedUrl,
     this.originalUrl,
+    this.authAttempted = false,
   });
 
   @override
@@ -69,6 +74,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   bool _isConnecting = false;
   int _reconnectAttempts = 0;
   bool _reconnectScheduled = false;
+  bool _sessionEnded = false;
 
   CollectionReference? _transcriptsRef;
   String _sessionId = '';
@@ -89,6 +95,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   String? _sseSessionId;
   String? _baseUrl;
   String? _cookieString; // used for non-web fallback
+  bool _redirectingToAuth = false;
 
   bool get _isDesktop {
     if (kIsWeb) return false;
@@ -149,8 +156,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   @override
   void initState() {
     super.initState();
-    _checkAuth();
-    if (kDebugMode) print('🔗 SSE URL: ${widget.resolvedUrl}');
+    if (kDebugMode) debugPrint('🔗 SSE URL: ${widget.resolvedUrl}');
     _baseUrl = widget.originalUrl != null
         ? Uri.parse(widget.originalUrl!).origin
         : Uri.parse(widget.resolvedUrl).origin;
@@ -183,18 +189,52 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     if (mounted) Navigator.pop(context);
   }
 
-  Future<void> _checkAuth() async {
-    if (kIsWeb) return;
-    final cookies = await _secureStorage.read(key: 'cookies');
-    if (cookies == null || cookies.isEmpty) {
-      if (mounted && widget.originalUrl != null) {
-        Navigator.pushReplacementNamed(
-          context,
-          '/auth',
-          arguments: {'originalUrl': widget.originalUrl!, 'resolvedUrl': widget.resolvedUrl},
-        );
-      }
+  /// The silent-auth screen uses webview_flutter, which only exists on
+  /// Android, iOS and macOS. Elsewhere we skip it instead of crashing.
+  bool get _webViewSupported {
+    if (kIsWeb) return false;
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.android:
+      case TargetPlatform.iOS:
+      case TargetPlatform.macOS:
+        return true;
+      default:
+        return false;
     }
+  }
+
+  /// Opens the WebView auth screen. Only called after the server has actually
+  /// refused us (HTTP 401/403), and at most once per visit, so it can't loop.
+  /// Returns true if we navigated away.
+  bool _goToAuth() {
+    if (!_webViewSupported ||
+        widget.authAttempted ||
+        widget.originalUrl == null ||
+        _redirectingToAuth ||
+        !mounted) {
+      return false;
+    }
+    _redirectingToAuth = true;
+    Navigator.pushReplacementNamed(
+      context,
+      '/auth',
+      arguments: {'originalUrl': widget.originalUrl!, 'resolvedUrl': widget.resolvedUrl},
+    );
+    return true;
+  }
+
+  /// Stores cookies from a `Set-Cookie` header (name=value pairs only),
+  /// merged with what we already have.
+  Future<void> _storeSetCookie(String? setCookieHeader) async {
+    final fresh = parseSetCookieHeader(setCookieHeader);
+    if (fresh.isEmpty) return;
+    _cookieString = mergeCookieHeaders(_cookieString, fresh);
+    try {
+      await _secureStorage.write(key: 'cookies', value: _cookieString);
+    } catch (e) {
+      debugPrint('⚠️ Could not persist cookies: $e');
+    }
+    debugPrint('🍪 Stored cookie: $_cookieString');
   }
 
   void _setupAudioListeners() {
@@ -256,25 +296,36 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       }
       _sessionId = 'temp_${DateTime.now().millisecondsSinceEpoch}';
     }
-    await _fetchLanguageMapping();
+
+    // Reuse cookies from an earlier visit or from the auth screen.
+    if (!kIsWeb) {
+      try {
+        final stored = await _secureStorage.read(key: 'cookies');
+        if (stored != null && stored.isNotEmpty) _cookieString = stored;
+      } catch (e) {
+        debugPrint('⚠️ Could not read stored cookies: $e');
+      }
+    }
+
+    final status = await _fetchLanguageMapping();
+    if ((status == 401 || status == 403) && _goToAuth()) return;
     _connect(widget.resolvedUrl);
   }
 
-  Future<void> _fetchLanguageMapping() async {
-    if (widget.originalUrl == null || !widget.originalUrl!.startsWith('http')) return;
+  /// Returns the HTTP status of the session page, or null if it failed.
+  Future<int?> _fetchLanguageMapping() async {
+    if (widget.originalUrl == null || !widget.originalUrl!.startsWith('http')) return null;
     try {
+      final headers = _browserHeaders();
+      if (!kIsWeb && _cookieString != null && _cookieString!.isNotEmpty) {
+        headers['Cookie'] = _cookieString!;
+      }
       final response = await _httpClient.get(
         Uri.parse(widget.originalUrl!),
-        headers: _browserHeaders(),
+        headers: headers,
       );
-      if (response.statusCode != 200) return;
-
-      final setCookie = response.headers['set-cookie'];
-      if (setCookie != null && setCookie.isNotEmpty) {
-        _cookieString = setCookie;
-        await _secureStorage.write(key: 'cookies', value: setCookie);
-        debugPrint('🍪 Stored cookie: $_cookieString');
-      }
+      if (!kIsWeb) await _storeSetCookie(response.headers['set-cookie']);
+      if (response.statusCode != 200) return response.statusCode;
 
       final body = response.body;
       final senderRegex = RegExp(r'data-sender="([^"]+)"');
@@ -304,26 +355,37 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
           }
         }
       }
+      return response.statusCode;
     } catch (e) {
       debugPrint('Could not fetch language mapping: $e');
+      return null;
     }
   }
 
   Map<String, String> _browserHeaders() {
+    const accept = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8';
+    if (kIsWeb) {
+      // Browsers refuse to let scripts set User-Agent, Cookie, Referer,
+      // Origin, Connection etc.; they add those themselves.
+      return {'Accept': accept};
+    }
+    // No Accept-Encoding: Dart's HttpClient adds gzip itself and decodes it,
+    // but it cannot decode brotli ("br"), which we used to advertise.
     return {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept': accept,
       'Accept-Language': 'en-US,en;q=0.5',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Connection': 'keep-alive',
       'Upgrade-Insecure-Requests': '1',
     };
   }
 
   // ========== Reconnect ==========
-  void _reconnect() {
+  /// [manual] is true when the user taps Retry: that starts a fresh round of
+  /// attempts. Automatic reconnects keep counting so the limit can be reached.
+  void _reconnect({bool manual = false}) {
+    if (!mounted) return;
     _reconnectScheduled = false;
-    _reconnectAttempts = 0;
+    if (manual) _reconnectAttempts = 0;
     _channel?.sink.close();
     _sseSubscription?.cancel();
     _sseSubscription = null;
@@ -366,6 +428,15 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   }
 
   void _scheduleReconnect() {
+    if (_sessionEnded) {
+      if (mounted) {
+        setState(() {
+          _isConnecting = false;
+          _errorMessage = 'The session has ended.';
+        });
+      }
+      return;
+    }
     if (_reconnectScheduled) return;
     if (_reconnectAttempts >= 3) {
       debugPrint('❌ Max reconnect attempts reached. Showing Retry button.');
@@ -390,26 +461,34 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   void _connectSSE(String url) {
     debugPrint('🔗 Connecting to SSE: $url');
     final headers = {
+      ..._browserHeaders(),
       'Accept': 'text/event-stream',
       'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      ..._browserHeaders(),
     };
-    if (widget.originalUrl != null) {
-      headers['Referer'] = widget.originalUrl!;
-      headers['Origin'] = _baseUrl!;
-    }
-    if (_cookieString != null && _cookieString!.isNotEmpty) {
-      headers['Cookie'] = _cookieString!;
+    if (!kIsWeb) {
+      if (widget.originalUrl != null) {
+        headers['Referer'] = widget.originalUrl!;
+        headers['Origin'] = _baseUrl!;
+      }
+      if (_cookieString != null && _cookieString!.isNotEmpty) {
+        headers['Cookie'] = _cookieString!;
+      }
     }
     _httpClient.send(http.Request('GET', Uri.parse(url))..headers.addAll(headers))
         .then((response) {
+      if ((response.statusCode == 401 || response.statusCode == 403) && _goToAuth()) {
+        response.stream.listen(null).cancel(); // release the connection
+        return;
+      }
       if (response.statusCode != 200) throw Exception('Server returned HTTP ${response.statusCode}');
       final stream = response.stream.transform(utf8.decoder);
       String buffer = '';
       StreamSubscription<String> subscription;
       subscription = stream.listen((String chunk) {
         buffer += chunk;
+        // Normalize CRLF / CR line endings to LF. A trailing \r is kept,
+        // because it may be the first half of a \r\n split across chunks.
+        buffer = buffer.replaceAll(RegExp(r'\r\n|\r(?!$)'), '\n');
         final events = buffer.split('\n\n');
         if (events.length > 1) {
           buffer = events.removeLast();
@@ -440,7 +519,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       setState(() {
         _isConnected = true;
         _isConnecting = false;
-        _reconnectAttempts = 0;
       });
     }).catchError((error) {
       debugPrint('❌ Failed to connect SSE: $error');
@@ -473,44 +551,14 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }
   }
 
-  void _connectWebSocket(String url) {
+  Future<void> _connectWebSocket(String url) async {
     debugPrint('🔗 Connecting to WebSocket: $url');
+    final WebSocketChannel channel;
     try {
-      _channel = WebSocketChannel.connect(Uri.parse(url));
-      _channel!.stream.listen(
-        (data) async {
-          try {
-            final Map<String, dynamic> json = data is String ? jsonDecode(data) : data as Map<String, dynamic>;
-            await _handleMessage(json);
-          } catch (e) {
-            debugPrint('⚠️ WebSocket parse error: $e');
-          }
-        },
-        onError: (error) {
-          debugPrint('❌ WebSocket error: $error');
-          if (!mounted) return;
-          setState(() {
-            _errorMessage = 'WebSocket error: $error';
-            _isConnected = false;
-            _isConnecting = false;
-          });
-          _scheduleReconnect();
-        },
-        onDone: () {
-          debugPrint('🔌 WebSocket disconnected');
-          if (!mounted) return;
-          setState(() {
-            _isConnected = false;
-            _isConnecting = false;
-          });
-          _scheduleReconnect();
-        },
-      );
-      setState(() {
-        _isConnected = true;
-        _isConnecting = false;
-        _reconnectAttempts = 0;
-      });
+      channel = WebSocketChannel.connect(Uri.parse(url));
+      _channel = channel;
+      // Wait for the handshake before reporting the connection as live.
+      await channel.ready;
     } catch (e) {
       debugPrint('❌ Failed to connect WebSocket: $e');
       if (!mounted) return;
@@ -520,7 +568,48 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         _isConnecting = false;
       });
       _scheduleReconnect();
+      return;
     }
+
+    if (!mounted) {
+      channel.sink.close();
+      return;
+    }
+
+    channel.stream.listen(
+      (data) async {
+        try {
+          final Map<String, dynamic> json = data is String ? jsonDecode(data) : data as Map<String, dynamic>;
+          await _handleMessage(json);
+        } catch (e) {
+          debugPrint('⚠️ WebSocket parse error: $e');
+        }
+      },
+      onError: (error) {
+        debugPrint('❌ WebSocket error: $error');
+        if (!mounted) return;
+        setState(() {
+          _errorMessage = 'WebSocket error: $error';
+          _isConnected = false;
+          _isConnecting = false;
+        });
+        _scheduleReconnect();
+      },
+      onDone: () {
+        debugPrint('🔌 WebSocket disconnected');
+        if (!mounted) return;
+        setState(() {
+          _isConnected = false;
+          _isConnecting = false;
+        });
+        _scheduleReconnect();
+      },
+    );
+
+    setState(() {
+      _isConnected = true;
+      _isConnecting = false;
+    });
   }
 
   String _extractLanguageFromSender(String sender) {
@@ -547,8 +636,41 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     });
   }
 
+  /// True if the audio field is a URL/path rather than inline base64 data.
+  /// Base64 never contains ? . : & _ - and real PCM payloads are long.
+  bool _looksLikeAudioUrl(String value) {
+    if (value.startsWith('http://') || value.startsWith('https://')) return true;
+    if (RegExp(r'[?.:&_\-]').hasMatch(value)) return true;
+    return value.startsWith('/') && value.length < 300;
+  }
+
+  /// Saves only stable (final) segments, one document per segment key, so
+  /// later corrections overwrite the document instead of adding new ones.
+  /// Unstable partial hypotheses are never written.
+  void _saveToFirestore(String key, TranscriptMessage msg) {
+    final ref = _transcriptsRef;
+    if (ref == null || msg.isUnstable) return;
+    var docId = key.replaceAll(RegExp(r'[/\s]+'), '_');
+    if (docId.length > 200) docId = docId.substring(0, 200);
+    ref.doc(docId).set({
+      'transcript': msg.transcript,
+      'translations': msg.translations,
+      'timestamp': Timestamp.fromDate(msg.timestamp),
+      'language': msg.language,
+      'isUnstable': false,
+    }).catchError((Object e) {
+      debugPrint('⚠️ Could not save to Firestore: $e');
+    });
+  }
+
   // ========== MAIN MESSAGE HANDLER ==========
   Future<void> _handleMessage(Map<String, dynamic> json) async {
+    if (json['controll'] == 'END' && (json['sender'] ?? '').toString().startsWith('asr')) {
+      _sessionEnded = true;
+    }
+    // Data is flowing, so the connection is healthy: reset the retry budget.
+    _reconnectAttempts = 0;
+
     debugPrint('📩 JSON keys: ${json.keys}');
     debugPrint('🔍 sender: "${json["sender"]}"');
 
@@ -602,63 +724,50 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       // Audio fetching
       Uint8List? audioBytes;
       String? audioUrl;
-      final audioUrlPath = json['b64_enc_pcm_s16le'] as String?;
-      if (audioUrlPath != null) {
+      final audioField = (json['b64_enc_pcm_s16le'] as String?)?.trim();
+      final sampleRate = (json['sample_rate'] as num?)?.toInt() ?? 16000;
+      if (audioField != null && audioField.isNotEmpty && !_looksLikeAudioUrl(audioField)) {
+        // Inline audio: base64-encoded 16-bit little-endian PCM.
         try {
-          String fullUrl = audioUrlPath.startsWith('http')
-              ? audioUrlPath
-              : '$_baseUrl$audioUrlPath';
-          final uri = Uri.parse(fullUrl);
-          final params = Map<String, String>.from(uri.queryParameters);
-          if (_sseSessionId != null) {
-            params['session'] = _sseSessionId!;
-            params['sid'] = _sseSessionId!;
-            params['channel'] = _sseSessionId!;
-            params['token'] = _sseSessionId!;
-            params['stream'] = _sseSessionId!;
+          final pcm = base64Decode(audioField);
+          audioBytes = _pcmToWav(pcm, sampleRate: sampleRate);
+          debugPrint('✅ Decoded inline audio: ${audioBytes.length} bytes');
+        } catch (e) {
+          debugPrint('❌ Could not decode inline audio: $e');
+        }
+      } else if (audioField != null && audioField.isNotEmpty) {
+        // Use the audio link exactly as the server sends it. The extra
+        // session/sid/channel/token/stream parameters we used to add made
+        // the server ask for a login.
+        final fullUrl = audioField.startsWith('http') ? audioField : '$_baseUrl$audioField';
+        debugPrint('🎵 Audio URL: $fullUrl');
+        try {
+          final headers = _browserHeaders();
+          if (!kIsWeb) {
+            headers['Referer'] = _baseUrl!;
+            if (_cookieString != null && _cookieString!.isNotEmpty) {
+              headers['Cookie'] = _cookieString!;
+            }
           }
-          fullUrl = uri.replace(queryParameters: params).toString();
-          debugPrint('🎵 Audio URL: $fullUrl');
-
-          if (kIsWeb) {
-            audioUrl = fullUrl;
+          final response = await _httpClient
+              .get(Uri.parse(fullUrl), headers: headers)
+              .timeout(const Duration(seconds: 15));
+          if (response.statusCode == 200) {
+            // The server sends raw PCM, which no player can play directly,
+            // so wrap it in a WAV header (on web too).
+            audioBytes = _pcmToWav(response.bodyBytes, sampleRate: sampleRate);
+            debugPrint('✅ Downloaded audio: ${audioBytes.length} bytes');
           } else {
-            // Non‑web: download and convert to WAV
-            final headers = {
-              ..._browserHeaders(),
-              'Referer': _baseUrl!,
-              'Origin': _baseUrl!,
-            };
-            String? cookieToSend = _cookieString;
-            if (cookieToSend == null || cookieToSend.isEmpty) {
-              cookieToSend = await _secureStorage.read(key: 'cookies');
-            }
-            if (cookieToSend != null && cookieToSend.isNotEmpty) {
-              headers['Cookie'] = cookieToSend;
-            } else if (_sseSessionId != null) {
-              headers['Cookie'] = 'session=$_sseSessionId;';
-            }
-
-            final response = await _httpClient.get(
-              Uri.parse(fullUrl),
-              headers: headers,
-            ).timeout(const Duration(seconds: 15));
-
-            if (response.statusCode == 200) {
-              final wavBytes = _pcmToWav(response.bodyBytes, sampleRate: 16000);
-              audioBytes = wavBytes;
-              debugPrint('✅ Downloaded & converted audio: ${audioBytes.length} bytes');
-            } else {
-              debugPrint('❌ Failed to fetch audio: HTTP ${response.statusCode}');
-            }
+            audioUrl = fullUrl; // fallback: web opens the link in a tab
+            debugPrint('❌ Failed to fetch audio: HTTP ${response.statusCode}');
           }
         } catch (e) {
-          debugPrint('❌ Error processing audio: $e');
+          audioUrl = fullUrl;
+          debugPrint('❌ Error downloading audio: $e');
         }
       }
-
       // Merge with existing transcript of same language and text
-      String key;
+      String key = '';
       bool foundMatch = false;
       final trimmedText = transcriptText.trim();
       for (final entry in _messagesMap.entries) {
@@ -673,8 +782,9 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
             timestamp: msg.timestamp,
             language: msg.language,
             isUnstable: msg.isUnstable,
-            audioData: audioBytes,
-            audioUrl: audioUrl,
+            // Don't wipe audio we already have if this download failed.
+            audioData: audioBytes ?? msg.audioData,
+            audioUrl: audioUrl ?? msg.audioUrl,
           );
           _messagesMap[key] = updatedMsg;
           foundMatch = true;
@@ -699,19 +809,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       }
 
       // Save to Firestore (optional)
-      if (_transcriptsRef != null) {
-        try {
-          await _transcriptsRef!.add({
-            'transcript': transcriptText,
-            'translations': {},
-            'timestamp': Timestamp.fromDate(DateTime.now()),
-            'language': language,
-            'isUnstable': false,
-          });
-        } catch (e) {
-          debugPrint('⚠️ Could not save to Firestore: $e');
-        }
-      }
+      _saveToFirestore(key, _messagesMap[key]!);
 
       if (!mounted) return;
       setState(() {
@@ -763,19 +861,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       audioUrl: null,
     );
 
-    if (_transcriptsRef != null) {
-      try {
-        await _transcriptsRef!.add({
-          'transcript': transcriptText,
-          'translations': {},
-          'timestamp': Timestamp.fromDate(DateTime.now()),
-          'language': language,
-          'isUnstable': isUnstable,
-        });
-      } catch (e) {
-        debugPrint('⚠️ Could not save to Firestore: $e');
-      }
-    }
+    _saveToFirestore(key, _messagesMap[key]!);
 
     if (!mounted) return;
     setState(() {
@@ -787,8 +873,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
   // ========== PLAY / PAUSE (SIMPLIFIED) ==========
   Future<void> _playPause(String key, TranscriptMessage message) async {
-    if (kIsWeb) {
-      // Web: simply open the audio URL in a new tab
+    if (kIsWeb && message.audioData == null) {
+      // Web with a server URL: simply open the audio URL in a new tab
       if (message.audioUrl == null) {
         debugPrint('⚠️ No audio URL for web');
         return;
@@ -824,7 +910,12 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }
 
     try {
-      await _audioPlayer.setSourceBytes(message.audioData!);
+      if (kIsWeb) {
+        // Inline audio on web: play it as a data: URL in the browser.
+        await _audioPlayer.setSourceUrl('data:audio/wav;base64,${base64Encode(message.audioData!)}');
+      } else {
+        await _audioPlayer.setSourceBytes(message.audioData!);
+      }
       await _audioPlayer.resume();
       if (!mounted) return;
       setState(() {
@@ -982,7 +1073,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       if (!_isConnected && !_isConnecting)
-                        TextButton(onPressed: _reconnect, child: const Text('Retry')),
+                        TextButton(onPressed: () => _reconnect(manual: true), child: const Text('Retry')),
                       TextButton.icon(
                         onPressed: () => _closeSession(showConfirmation: true),
                         icon: const Icon(Icons.close, size: 18),
@@ -1014,7 +1105,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                   final message = _messagesMap[key]!;
                   // For web: show play button if audioUrl exists
                   final hasAudio = kIsWeb
-                      ? message.audioUrl != null
+                      ? (message.audioUrl != null || message.audioData != null)
                       : message.audioData != null;
 
                   return Card(
@@ -1031,7 +1122,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                               overflow: TextOverflow.ellipsis,
                               style: TextStyle(
                                 fontSize: 16,
-                                color: message.isUnstable ? Colors.grey : Colors.black,
+                                color: message.isUnstable ? Colors.grey : null,
                               ),
                             ),
                           ),
@@ -1058,7 +1149,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                               onPressed: () => _playPause(key, message),
                             ),
                             // Show progress only for non-web (since web just opens in new tab)
-                            if (!kIsWeb && message.audioData != null) ...[
+                            if (message.audioData != null) ...[
                               const SizedBox(width: 8),
                               SizedBox(
                                 width: 60,

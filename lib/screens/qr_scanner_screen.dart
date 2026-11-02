@@ -114,16 +114,13 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
   // ─── Process scanned or manual input ──────────────────────────
 
   Future<void> _proceedWithUrl(String rawInput) async {
-    if (rawInput.trim().isEmpty) return;
+    if (rawInput.trim().isEmpty || _isProcessing) return;
 
+    // The camera keeps running; _isProcessing makes _onScanComplete ignore
+    // further detections. Stopping and restarting it caused
+    // "controllerAlreadyInitialized" on web.
     setState(() => _isProcessing = true);
 
-    if (scannerController != null) {
-      await scannerController!.stop();
-    }
-
-    if (!mounted) return;
-    // Show loading dialog – we guard later uses with mounted checks
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -134,22 +131,27 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
     try {
       resolvedUrl = await _resolveUrl(rawInput);
     } catch (e) {
-      // Only interact with UI if still mounted
+      debugPrint('❌ Could not resolve $rawInput: $e');
       if (mounted) {
         Navigator.pop(context); // close loading dialog
+        final blockedByBrowser = kIsWeb && e is http.ClientException;
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error resolving: $e'), backgroundColor: Colors.red),
+          SnackBar(
+            content: Text(blockedByBrowser
+                ? 'The browser blocked the request to this server (CORS). '
+                    'Try the Windows or Android version, or see the debug notes.'
+                : 'Error resolving: $e'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 6),
+          ),
         );
-        await scannerController?.start();
         setState(() => _isProcessing = false);
       }
       return;
     }
 
-    // Store the raw input (short link) in history
     await _addToHistory(rawInput);
 
-    // Navigate away only if still mounted
     if (mounted) {
       Navigator.pop(context); // close loading dialog
       Navigator.pushReplacementNamed(
@@ -157,12 +159,12 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
         '/live',
         arguments: {
           'resolvedUrl': resolvedUrl,
-          'originalUrl': rawInput,   // the short link the user scanned/entered
+          'originalUrl': rawInput,
         },
       );
     }
   }
-
+  
   // ─── UI ─────────────────────────────────────────────────────────
 
   Widget _buildManualEntryScreen() {
@@ -223,8 +225,9 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
       return _buildManualEntryScreen();
     }
 
-    return Scaffold(
-      body: MobileScanner(
+    // The outer Scaffold in build() owns the FAB; a nested Scaffold with its
+    // own FAB caused two overlapping buttons and a duplicate Hero tag.
+    return MobileScanner(
         controller: controller,
         onDetect: _onScanComplete,
         errorBuilder: (context, error) {
@@ -261,13 +264,7 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
             ),
           );
         },
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _showManualEntryDialog,
-        icon: const Icon(Icons.edit),
-        label: const Text('Enter URL manually'),
-      ),
-    );
+      );
   }
 
   Future<void> _onScanComplete(BarcodeCapture capture) async {

@@ -9,6 +9,7 @@ import 'dart:developer' as developer;
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import '../route_observer.dart';
+import '../theme_controller.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pdf/pdf.dart';
@@ -117,7 +118,7 @@ class SessionHistoryItem {
 }
 
 // ========== Settings Keys ==========
-const String _kThemeModeKey = 'theme_mode';
+const String _kThemeModeKey = kThemeModeKey;
 const String _kKeepScreenOnKey = 'keep_screen_on';
 
 // ========== Screen ==========
@@ -181,7 +182,8 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
   Future<void> _saveThemeMode(String mode) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_kThemeModeKey, mode);
-    setState(() => _themeMode = mode);
+    themeModeNotifier.value = themeModeFromString(mode);
+    if (mounted) setState(() => _themeMode = mode);
   }
 
   Future<void> _saveKeepScreenOn(bool value) async {
@@ -569,6 +571,16 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
 
   // ---------- Share / PDF generation ----------
   Future<void> _showLanguageDialog(String sessionUrl) async {
+    if (kIsWeb) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('PDF export is not available in the web version.'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+
     // Try to get the stored language map from history first
     Map<String, String>? langMap;
     try {
@@ -782,6 +794,12 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     return widgets;
   }
 
+  /// Replaces characters that are not allowed in file names on any platform.
+  String _safeFileName(String input) {
+    final cleaned = input.replaceAll(RegExp(r'[\\/:*?"<>|\s]+'), '_');
+    return cleaned.isEmpty ? 'file' : cleaned;
+  }
+
   Future<File> _generatePdfFromHtml(String html, String languageName, String sessionId) async {
     final fontMap = await _loadAllFonts();
     
@@ -818,7 +836,8 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     );
 
     final directory = await getTemporaryDirectory();
-    final fileName = 'lecture_${sessionId.substring(0, 8)}_$languageName.pdf';
+    final shortId = sessionId.length > 8 ? sessionId.substring(0, 8) : sessionId;
+    final fileName = 'lecture_${_safeFileName(shortId)}_${_safeFileName(languageName)}.pdf';
     final file = File('${directory.path}/$fileName');
     await file.writeAsBytes(await pdf.save());
     return file;
@@ -828,9 +847,18 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
   // FIXED: Added sessionUrl parameter to build the endpoint dynamically
   // ====================================================================
   Future<void> _fetchAndSharePdf(String sessionId, String languageName, String sessionUrl) async {
+    bool loadingDialogOpen = true;
+    void closeLoadingDialog() {
+      if (loadingDialogOpen && mounted) {
+        Navigator.of(context, rootNavigator: true).pop();
+      }
+      loadingDialogOpen = false;
+    }
+
     showDialog(
       context: context,
       barrierDismissible: false,
+      useRootNavigator: true,
       builder: (context) => const Center(child: CircularProgressIndicator()),
     );
 
@@ -853,8 +881,8 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
 
       final htmlContent = response.body.trim();
       if (htmlContent.isEmpty) {
+        closeLoadingDialog();
         if (mounted) {
-          Navigator.pop(context);
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
               content: Text('No cached text available for this language yet.'),
@@ -871,9 +899,8 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
 
       final pdfFile = await _generatePdfFromHtml(htmlContent, languageName, sessionId);
 
+      closeLoadingDialog();
       if (mounted) {
-        Navigator.pop(context);
-
         final action = await showDialog<String>(
           context: context,
           builder: (context) => AlertDialog(
@@ -903,8 +930,9 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
         }
       }
     } catch (e) {
+      // Only closes the loading dialog if it is still open – never the screen.
+      closeLoadingDialog();
       if (mounted) {
-        Navigator.pop(context);
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
         );
@@ -925,7 +953,7 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
   Future<void> _savePdfToDownloads(File pdfFile, String languageName) async {
     try {
       final downloadsDir = await getDownloadsDirectory();
-      final fileName = 'lecture_${DateTime.now().millisecondsSinceEpoch}_$languageName.pdf';
+      final fileName = 'lecture_${DateTime.now().millisecondsSinceEpoch}_${_safeFileName(languageName)}.pdf';
       if (downloadsDir != null) {
         await pdfFile.copy('${downloadsDir.path}/$fileName');
         if (mounted) {
@@ -1176,4 +1204,4 @@ class _SettingsDialogState extends State<_SettingsDialog> {
       Navigator.pop(context);
     }
   }
-}
+}

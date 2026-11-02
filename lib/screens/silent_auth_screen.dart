@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
+import '../cookie_utils.dart';
 
 class SilentAuthScreen extends StatefulWidget {
   final String originalUrl;
@@ -24,6 +25,10 @@ class _SilentAuthScreenState extends State<SilentAuthScreen> {
   String? _errorMessage;
   final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
 
+  /// Set once we navigate away, so later onPageFinished calls (redirects,
+  /// iframes) can't push the live screen a second time.
+  bool _done = false;
+
   @override
   void initState() {
     super.initState();
@@ -35,10 +40,14 @@ class _SilentAuthScreenState extends State<SilentAuthScreen> {
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageFinished: (String url) async {
+            if (!mounted || _done) return;
             setState(() => _isLoading = false);
             await _checkCookies();
           },
           onWebResourceError: (WebResourceError error) {
+            // Ignore failing sub-resources (images, trackers, ...).
+            if (error.isForMainFrame == false) return;
+            if (!mounted || _done) return;
             setState(() {
               _isLoading = false;
               _errorMessage = 'Failed to load page: ${error.description}';
@@ -57,35 +66,47 @@ class _SilentAuthScreenState extends State<SilentAuthScreen> {
 
   Future<void> _checkCookies() async {
     try {
-      final cookies = await _controller.runJavaScriptReturningResult(
-        'document.cookie',
-      ) as String?;
+      final result = await _controller.runJavaScriptReturningResult('document.cookie');
+      // Android returns a JSON-quoted string; iOS/macOS return it plain.
+      final cookies = normalizeJsStringResult(result);
+      if (!mounted || _done) return;
 
-      if (cookies != null && cookies.isNotEmpty) {
-        await _secureStorage.write(key: 'cookies', value: cookies);
-        debugPrint('🍪 Stored cookie: $cookies');
-
-        if (mounted) {
-          Navigator.pushReplacementNamed(
-            context,
-            '/live',
-            arguments: {
-              'resolvedUrl': widget.resolvedUrl,
-              'originalUrl': widget.originalUrl,
-            },
-          );
-        }
+      if (cookies.isNotEmpty) {
+        final existing = await _secureStorage.read(key: 'cookies');
+        final merged = mergeCookieHeaders(existing, parseCookieHeader(cookies));
+        await _secureStorage.write(key: 'cookies', value: merged);
+        debugPrint('🍪 Stored cookie: $merged');
+        _goToLive();
       } else {
+        // document.cookie cannot see HttpOnly cookies, which is how most
+        // servers mark session cookies.
         setState(() {
-          _errorMessage = 'No cookies found. Please try again or log in manually.';
+          _errorMessage = 'No readable cookies found. The server may use HttpOnly '
+              'cookies, which the app cannot read. You can continue without them.';
         });
       }
     } catch (e) {
       debugPrint('⚠️ Failed to read cookies: $e');
+      if (!mounted || _done) return;
       setState(() {
         _errorMessage = 'Could not retrieve authentication cookies. Please try again.';
       });
     }
+  }
+
+  void _goToLive() {
+    if (_done || !mounted) return;
+    _done = true;
+    Navigator.pushReplacementNamed(
+      context,
+      '/live',
+      arguments: {
+        'resolvedUrl': widget.resolvedUrl,
+        'originalUrl': widget.originalUrl,
+        // Tells the live screen not to send us back here (prevents loops).
+        'authAttempted': true,
+      },
+    );
   }
 
   void _retry() {
@@ -123,9 +144,19 @@ class _SilentAuthScreenState extends State<SilentAuthScreen> {
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 12),
-                  ElevatedButton(
-                    onPressed: _retry,
-                    child: const Text('Retry'),
+                  Wrap(
+                    spacing: 12,
+                    alignment: WrapAlignment.center,
+                    children: [
+                      ElevatedButton(
+                        onPressed: _retry,
+                        child: const Text('Retry'),
+                      ),
+                      OutlinedButton(
+                        onPressed: _goToLive,
+                        child: const Text('Continue anyway'),
+                      ),
+                    ],
                   ),
                 ],
               ),
