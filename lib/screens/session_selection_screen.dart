@@ -283,19 +283,16 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
       if (response.statusCode != 200) {
         return {};
       }
-      final body = response.body;
-      final langIndexRegex = RegExp(r'data-lang-index="([^"]+)"');
-      final match = langIndexRegex.firstMatch(body);
-      if (match == null) {
-        return {};
-      }
-      final raw = match.group(1)!.replaceAll('&quot;', '"');
-      final Map<String, dynamic> map = jsonDecode(raw);
+      // KIT's session page declares its languages in inline JavaScript:
+      //   lang_index["German"] = "8"
+      // (The data-lang-index attribute the old code looked for is only
+      // created later by the page's script, so it is never in this HTML.)
       final result = <String, String>{};
-      for (final entry in map.entries) {
-        final name = entry.key;
+      final indexRe = RegExp(r'lang_index\["([^"]+)"\]\s*=\s*"(\d+)"');
+      for (final m in indexRe.allMatches(response.body)) {
+        final name = m.group(1)!;
         if (!name.contains('Audio') && !name.contains('Correction')) {
-          result[name] = entry.value.toString();
+          result[name] = m.group(2)!;
         }
       }
       return result;
@@ -1204,4 +1201,4 @@ class _SettingsDialogState extends State<_SettingsDialog> {
       Navigator.pop(context);
     }
   }
-}
+}

@@ -12,6 +12,7 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../models/transcript_message.dart';
 import '../cookie_utils.dart';
+import '../language_names.dart';
 
 // Conditional import: use dart:html on web, stub elsewhere
 import 'package:asr_live_translator/web_stub.dart'
@@ -36,36 +37,17 @@ class LiveTranscriptScreen extends StatefulWidget {
 }
 
 class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
-  // Built-in fallback for common language codes
-  static const Map<String, String> _languageCodeMap = {
-    'en': 'English',
-    'es': 'Spanish',
-    'fr': 'French',
-    'de': 'German',
-    'it': 'Italian',
-    'pt': 'Portuguese',
-    'ru': 'Russian',
-    'zh': 'Chinese',
-    'ja': 'Japanese',
-    'ko': 'Korean',
-    'ar': 'Arabic',
-    'hi': 'Hindi',
-    'nl': 'Dutch',
-    'pl': 'Polish',
-    'tr': 'Turkish',
-    'vi': 'Vietnamese',
-    'th': 'Thai',
-    'id': 'Indonesian',
-    'ms': 'Malay',
-    'fil': 'Filipino',
-  };
-
   String? _selectedLanguage;
   final Set<String> _availableLanguages = {};
   final Map<String, TranscriptMessage> _messagesMap = {};
   bool _defaultFilterSet = false;
 
-  Map<String, String>? _senderToLanguage;
+  /// Language name per KIT sender ("mt:1" → "German"), asked from the
+  /// server once per sender – see _lookupSenderLanguage.
+  final Map<String, Future<String?>> _senderLookups = {};
+
+  /// Set when KIT announces the end of the lecture ("controll": "END").
+  bool _sessionEnded = false;
 
   WebSocketChannel? _channel;
   StreamSubscription? _sseSubscription;
@@ -74,7 +56,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   bool _isConnecting = false;
   int _reconnectAttempts = 0;
   bool _reconnectScheduled = false;
-  bool _sessionEnded = false;
 
   CollectionReference? _transcriptsRef;
   String _sessionId = '';
@@ -151,6 +132,37 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
     wavBytes.setRange(offset, offset + pcmData.length, pcmData);
     return wavBytes;
+  }
+
+  /// /webapi/stream/data answers with JSON that carries the audio as base64
+  /// 16-bit PCM (a bare JSON string or an object with the data in a field).
+  /// Falls back to raw PCM if the answer isn't JSON.
+  ({Uint8List pcm, int? sampleRate}) _decodeAudioResponse(http.Response response) {
+    final type = response.headers['content-type'] ?? '';
+    if (!type.contains('json')) {
+      return (pcm: response.bodyBytes, sampleRate: null);
+    }
+    final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+    String? b64;
+    int? rate;
+    if (decoded is String) {
+      b64 = decoded;
+    } else if (decoded is Map) {
+      final known = decoded['b64_enc_pcm_s16le'] ?? decoded['data'] ?? decoded['audio'];
+      if (known is String) b64 = known;
+      // Otherwise the longest text value is the audio.
+      b64 ??= decoded.values.whereType<String>().fold<String?>(
+          null, (best, s) => best == null || s.length > best.length ? s : best);
+      final r = decoded['sample_rate'] ?? decoded['sampleRate'] ?? decoded['sr'];
+      if (r is num) rate = r.toInt();
+    }
+    if (b64 == null || b64.isEmpty) {
+      throw const FormatException('No audio data found in the JSON answer');
+    }
+    if (b64.startsWith('data:') && b64.contains(',')) {
+      b64 = b64.substring(b64.indexOf(',') + 1);
+    }
+    return (pcm: base64Decode(base64.normalize(b64.trim())), sampleRate: rate);
   }
 
   @override
@@ -307,13 +319,16 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       }
     }
 
-    final status = await _fetchLanguageMapping();
+    final status = await _fetchSessionPage();
     if ((status == 401 || status == 403) && _goToAuth()) return;
     _connect(widget.resolvedUrl);
   }
 
-  /// Returns the HTTP status of the session page, or null if it failed.
-  Future<int?> _fetchLanguageMapping() async {
+  /// Loads the session page once: stores its cookies and returns its HTTP
+  /// status (null if it failed), so a 401/403 can open the login screen.
+  /// Language names are NOT in this page's HTML – the page asks the server
+  /// per sender, and so does this app (see _lookupSenderLanguage).
+  Future<int?> _fetchSessionPage() async {
     if (widget.originalUrl == null || !widget.originalUrl!.startsWith('http')) return null;
     try {
       final headers = _browserHeaders();
@@ -325,39 +340,9 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         headers: headers,
       );
       if (!kIsWeb) await _storeSetCookie(response.headers['set-cookie']);
-      if (response.statusCode != 200) return response.statusCode;
-
-      final body = response.body;
-      final senderRegex = RegExp(r'data-sender="([^"]+)"');
-      final senderMatch = senderRegex.firstMatch(body);
-      if (senderMatch != null) {
-        final raw = senderMatch.group(1)!.replaceAll('&quot;', '"');
-        final Map<String, dynamic> map = jsonDecode(raw);
-        _senderToLanguage = map.map((k, v) => MapEntry(k, v.toString()));
-      }
-      final langNameRegex = RegExp(r'data-lang-name="([^"]+)"');
-      final langNameMatch = langNameRegex.firstMatch(body);
-      if (langNameMatch != null) {
-        final raw = langNameMatch.group(1)!.replaceAll('&quot;', '"');
-        final Map<String, dynamic> map = jsonDecode(raw);
-        for (final entry in map.entries) {
-          final name = entry.value.toString();
-          if (!name.contains('Audio') && !name.contains('Correction')) {
-            _availableLanguages.add(name);
-          }
-        }
-        if (!_defaultFilterSet && _availableLanguages.isNotEmpty) {
-          if (mounted) {
-            setState(() {
-              _selectedLanguage = null;
-              _defaultFilterSet = true;
-            });
-          }
-        }
-      }
       return response.statusCode;
     } catch (e) {
-      debugPrint('Could not fetch language mapping: $e');
+      debugPrint('Could not load the session page: $e');
       return null;
     }
   }
@@ -385,7 +370,10 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   void _reconnect({bool manual = false}) {
     if (!mounted) return;
     _reconnectScheduled = false;
-    if (manual) _reconnectAttempts = 0;
+    if (manual) {
+      _reconnectAttempts = 0;
+      _sessionEnded = false;
+    }
     _channel?.sink.close();
     _sseSubscription?.cancel();
     _sseSubscription = null;
@@ -428,6 +416,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   }
 
   void _scheduleReconnect() {
+    if (_reconnectScheduled) return;
     if (_sessionEnded) {
       if (mounted) {
         setState(() {
@@ -437,7 +426,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       }
       return;
     }
-    if (_reconnectScheduled) return;
     if (_reconnectAttempts >= 3) {
       debugPrint('❌ Max reconnect attempts reached. Showing Retry button.');
       if (mounted) {
@@ -534,10 +522,12 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
   void _parseSSEEvent(String eventBlock) {
     debugPrint('📦 Full SSE event block:\n$eventBlock');
-    final lines = eventBlock.split('\n');
-    StringBuffer dataBuffer = StringBuffer();
-    for (final line in lines) {
-      if (line.startsWith('data:')) {
+    String eventName = '';
+    final dataBuffer = StringBuffer();
+    for (final line in eventBlock.split('\n')) {
+      if (line.startsWith('event:')) {
+        eventName = line.substring(6).trim();
+      } else if (line.startsWith('data:')) {
         dataBuffer.writeln(line.substring(5).trim());
       }
     }
@@ -545,6 +535,11 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     if (data.isEmpty) return;
     try {
       final json = jsonDecode(data);
+      if (json is! Map<String, dynamic>) return;
+      // KIT can tag a message with its stream via the SSE event name.
+      if (eventName.isNotEmpty && eventName != 'message') {
+        json.putIfAbsent('_channel', () => eventName);
+      }
       _handleMessage(json);
     } catch (e) {
       debugPrint('⚠️ Failed to parse SSE data: $e');
@@ -612,15 +607,76 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     });
   }
 
-  String _extractLanguageFromSender(String sender) {
-    if (_senderToLanguage != null && _senderToLanguage!.containsKey(sender)) {
-      return _senderToLanguage![sender]!;
+  /// Asks the server which language a stream is, exactly like KIT's own
+  /// session page does the first time it sees a sender:
+  ///   POST /webapi/<session>/<number after the colon>/get_output_language_component
+  ///   body: "{\"component\":\"mt:1\"}"   (JSON encoded twice)
+  ///   answer: German                        (plain text)
+  /// One request per sender; all its messages share the answer.
+  Future<String?> _lookupSenderLanguage(String sender) {
+    final parts = sender.split(':');
+    final channel =
+        Uri.tryParse(widget.resolvedUrl)?.queryParameters['channel'] ?? _sseSessionId;
+    if (parts.length < 2 || parts[1].isEmpty || channel == null || _baseUrl == null) {
+      return Future.value(null);
     }
-    // Fallback: if sender is a language code (e.g., 'en'), use built-in map
-    if (_languageCodeMap.containsKey(sender)) {
-      return _languageCodeMap[sender]!;
+    final url = '$_baseUrl/webapi/$channel/${parts[1]}/get_output_language_component';
+    return _senderLookups.putIfAbsent(sender, () => _askServerForLanguage(sender, url));
+  }
+
+  Future<String?> _askServerForLanguage(String sender, String url) async {
+    try {
+      final headers = <String, String>{'Content-Type': 'application/json;charset=UTF-8'};
+      if (!kIsWeb && _cookieString != null && _cookieString!.isNotEmpty) {
+        headers['Cookie'] = _cookieString!;
+      }
+      final resp = await _httpClient
+          .post(
+            Uri.parse(url),
+            headers: headers,
+            body: jsonEncode(jsonEncode({'component': sender})),
+          )
+          .timeout(const Duration(seconds: 10));
+      if (resp.statusCode != 200) {
+        debugPrint('❌ Language lookup for $sender: HTTP ${resp.statusCode}');
+        _forgetLookup(sender); // try again with its next message
+        return null;
+      }
+      var name = resp.body.trim();
+      if (name.startsWith('"')) {
+        try {
+          name = jsonDecode(name) as String;
+        } catch (_) {}
+      }
+      debugPrint('🌐 $sender → $name');
+      return name.isEmpty ? null : name;
+    } catch (e) {
+      debugPrint('❌ Language lookup for $sender failed: $e');
+      _forgetLookup(sender); // try again with its next message
+      return null;
     }
-    return sender;
+  }
+
+  /// Drops a failed lookup so the sender's next message asks again.
+  /// Deferred, because it may run while the lookup is being stored.
+  void _forgetLookup(String sender) =>
+      Future.microtask(() => _senderLookups.remove(sender));
+
+  /// Display name for a message's stream: "Transcript", "German", …
+  /// Falls back to a tidied sender name while the server can't be asked.
+  Future<String> _languageFor(String sender) async {
+    final fromServer = await _lookupSenderLanguage(sender);
+    return resolveLanguageName(fromServer ?? sender);
+  }
+
+  /// Adds a language to the dropdown (not "… Audio" / "… Correction").
+  void _registerLanguage(String language) {
+    if (language.isEmpty || language.contains('Audio') || language.contains('Correction')) {
+      return;
+    }
+    if (_availableLanguages.add(language) && mounted) {
+      setState(() => _defaultFilterSet = true);
+    }
   }
 
   String _cleanTranscript(String raw) => raw.replaceAll(RegExp(r'<[^>]*>'), ' ');
@@ -665,9 +721,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
   // ========== MAIN MESSAGE HANDLER ==========
   Future<void> _handleMessage(Map<String, dynamic> json) async {
-    if (json['controll'] == 'END' && (json['sender'] ?? '').toString().startsWith('asr')) {
-      _sessionEnded = true;
-    }
     // Data is flowing, so the connection is healthy: reset the retry budget.
     _reconnectAttempts = 0;
 
@@ -680,8 +733,18 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       debugPrint('📌 Captured session ID: $_sseSessionId');
     }
 
-    final sender = json['sender'] ?? '';
+    final String sender = (json['sender'] ?? '').toString();
     final isUnstable = json['unstable'] == true;
+
+    // KIT announces the end of the lecture per stream; the ASR one counts.
+    if ((json['controll'] ?? json['control']) == 'END' && sender.startsWith('asr')) {
+      _sessionEnded = true;
+    }
+
+    // Headings, paragraph breaks and summaries – not transcript lines.
+    if (RegExp(r'^(textstructurer|summar|lip|saasr|notes)').hasMatch(sender)) {
+      return;
+    }
     final start = json['start']?.toString() ?? '';
 
     // ============================================================
@@ -695,37 +758,17 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       }
       final transcriptText = _cleanTranscript(text);
 
-      // Extract language from sender (e.g., 'tts:en' -> 'en')
-      final langKey = sender.substring(4); // remove 'tts:'
-      String language;
-      // First, check the mapping from the HTML page
-      if (_senderToLanguage != null && _senderToLanguage!.containsKey(langKey)) {
-        language = _senderToLanguage![langKey]!;
-      } else if (_languageCodeMap.containsKey(langKey)) {
-        // Fallback to built‑in map
-        language = _languageCodeMap[langKey]!;
-      } else {
-        language = langKey; // keep as is
-      }
-
-      // Add language to available set
-      if (!language.contains('Audio') && !language.contains('Correction')) {
-        _availableLanguages.add(language);
-      }
-      if (!_defaultFilterSet && !language.contains('Audio') && !language.contains('Correction')) {
-        if (mounted) {
-          setState(() {
-            _selectedLanguage = null;
-            _defaultFilterSet = true;
-          });
-        }
-      }
+      // tts:N speaks the output of mt:N; the server names its language.
+      final String language = await _languageFor(sender);
+      _registerLanguage(language);
 
       // Audio fetching
       Uint8List? audioBytes;
       String? audioUrl;
       final audioField = (json['b64_enc_pcm_s16le'] as String?)?.trim();
-      final sampleRate = (json['sample_rate'] as num?)?.toInt() ?? 16000;
+      // KIT sends no rate for raw TTS PCM; 24 kHz is what its voices use
+      // (same default as the Flask relay).
+      final sampleRate = (json['sample_rate'] as num?)?.toInt() ?? 24000;
       if (audioField != null && audioField.isNotEmpty && !_looksLikeAudioUrl(audioField)) {
         // Inline audio: base64-encoded 16-bit little-endian PCM.
         try {
@@ -736,36 +779,31 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
           debugPrint('❌ Could not decode inline audio: $e');
         }
       } else if (audioField != null && audioField.isNotEmpty) {
-        // Use the audio link exactly as the server sends it. The extra
-        // session/sid/channel/token/stream parameters we used to add made
-        // the server ask for a login.
-        final fullUrl = audioField.startsWith('http') ? audioField : '$_baseUrl$audioField';
+        // The message links audio under /ltapi/ (internal, needs a login).
+        // KIT's public page fetches the same data under /webapi/ – no login.
+        final path = audioField.replaceFirst('/ltapi/', '/webapi/');
+        final fullUrl = path.startsWith('http') ? path : '$_baseUrl$path';
         debugPrint('🎵 Audio URL: $fullUrl');
         try {
           final headers = _browserHeaders();
-          if (!kIsWeb) {
-            headers['Referer'] = _baseUrl!;
-            if (_cookieString != null && _cookieString!.isNotEmpty) {
-              headers['Cookie'] = _cookieString!;
-            }
-          }
+          if (!kIsWeb) headers['Referer'] = widget.originalUrl ?? _baseUrl!;
           final response = await _httpClient
               .get(Uri.parse(fullUrl), headers: headers)
               .timeout(const Duration(seconds: 15));
           if (response.statusCode == 200) {
-            // The server sends raw PCM, which no player can play directly,
-            // so wrap it in a WAV header (on web too).
-            audioBytes = _pcmToWav(response.bodyBytes, sampleRate: sampleRate);
-            debugPrint('✅ Downloaded audio: ${audioBytes.length} bytes');
+            final audio = _decodeAudioResponse(response);
+            audioBytes = _pcmToWav(audio.pcm, sampleRate: audio.sampleRate ?? sampleRate);
+            debugPrint('✅ Audio ready: ${audioBytes.length} bytes');
           } else {
             audioUrl = fullUrl; // fallback: web opens the link in a tab
             debugPrint('❌ Failed to fetch audio: HTTP ${response.statusCode}');
           }
         } catch (e) {
           audioUrl = fullUrl;
-          debugPrint('❌ Error downloading audio: $e');
+          debugPrint('❌ Error loading audio: $e');
         }
       }
+
       // Merge with existing transcript of same language and text
       String key = '';
       bool foundMatch = false;
@@ -830,18 +868,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       return;
     }
 
-    final language = _extractLanguageFromSender(sender);
-    if (!language.contains('Audio') && !language.contains('Correction')) {
-      _availableLanguages.add(language);
-    }
-    if (!_defaultFilterSet && !language.contains('Audio') && !language.contains('Correction')) {
-      if (mounted) {
-        setState(() {
-          _selectedLanguage = null;
-          _defaultFilterSet = true;
-        });
-      }
-    }
+    final language = await _languageFor(sender);
+    _registerLanguage(language);
 
     String key;
     if (start.isNotEmpty) {
