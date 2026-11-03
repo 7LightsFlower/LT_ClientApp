@@ -89,13 +89,13 @@ BEGIN
     BEGIN
         BLOCK "040904e4"
         BEGIN
-            VALUE "CompanyName", "com.example" "\0"
-            VALUE "FileDescription", "lectureviewerapp" "\0"
+            VALUE "CompanyName", "Live Translator Viewer" "\0"
+            VALUE "FileDescription", "Live Translator Viewer" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
             VALUE "InternalName", "lectureviewerapp" "\0"
-            VALUE "LegalCopyright", "Copyright (C) 2026 com.example. All rights reserved." "\0"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Live Translator Viewer. All rights reserved." "\0"
             VALUE "OriginalFilename", "lectureviewerapp.exe" "\0"
-            VALUE "ProductName", "lectureviewerapp" "\0"
+            VALUE "ProductName", "Live Translator Viewer" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END
     END

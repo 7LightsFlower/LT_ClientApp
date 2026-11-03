@@ -1,188 +1,151 @@
 name: 0_build_7_days_test_IPA_for_iOS
 
+# Builds an UNSIGNED test IPA of LT_ClientApp ("Lectureviewerapp").
+# Sign it yourself (e.g. Sideloadly / AltStore with your Apple ID) – with a
+# free Apple ID the app then runs for 7 days.
+#
+# App-specific settings (keep in sync with the project):
+#   * Bundle ID live.translator.viewer ("Live Translator Viewer").
+#   * iOS 15.0 minimum, as in ios/Podfile and the Xcode project.
+
 on:
   workflow_dispatch:
 
+env:
+  IOS_DEPLOYMENT_TARGET: "15.0"
+  IPA_NAME: LT_ClientApp.ipa
+
 jobs:
   build-ios:
-    name: 🎉 iOS Build (7-days free testing)
-    runs-on: macos-14
-    env:
-      FLUTTER_SUPPRESS_SWIFT_PACKAGE_MANAGER: "1"   # disables SPM globally
+    name: 🎉 iOS Build LT_ClientApp (7-days free testing)
+    runs-on: macos-15
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
 
-      # 👇 Add this step to set Xcode 16.2 (or 16.1 / 16.0)
       - name: Set up Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '16.2'
+          xcode-version: latest-stable
 
       - uses: subosito/flutter-action@v2
         with:
-          channel: 'stable'
-          architecture: x64
+          channel: stable      # pubspec.lock needs Flutter >= 3.44
+          cache: true
 
-      - run: flutter clean
-
-      - name: Create SourcePackages directories for all platforms
-        run: |
-          mkdir -p build/ios/SourcePackages
-          mkdir -p build/macos/SourcePackages
-
+      # CocoaPods instead of Swift Package Manager (Podfile is set up for it)
       - name: Disable Swift Package Manager
         run: flutter config --no-enable-swift-package-manager
 
       - run: flutter pub get
-      
-      - name: Verify Bundle ID matches Firebase
-        run: |
-          echo "📱 Firebase expects:"
-          grep -o '<string>[^<]*</string>' ios/Runner/GoogleService-Info.plist | grep BUNDLE_ID -A1 | tail -1
-          
-          echo "📱 Xcode is building:"
-          grep "PRODUCT_BUNDLE_IDENTIFIER" ios/Runner.xcodeproj/project.pbxproj | head -2
-          
-      # --- Patch Podfile ---
-      - name: Replace post_install block in Podfile
-        run: |
-          python3 << 'PYTHON'
-          podfile_path = 'ios/Podfile'
-          with open(podfile_path, 'r') as f:
-              content = f.read()
-          lines = content.split('\n')
-          new_lines = []
-          in_post_install = False
-          indent_level = 0
-          for line in lines:
-              stripped = line.lstrip()
-              if stripped.startswith('post_install') and not in_post_install:
-                  in_post_install = True
-                  indent_level = len(line) - len(stripped)
-                  continue
-              if in_post_install:
-                  if stripped == 'end' or stripped.startswith('end'):
-                      current_indent = len(line) - len(stripped)
-                      if current_indent <= indent_level:
-                          in_post_install = False
-                          continue
-                  continue
-              else:
-                  new_lines.append(line)
 
-          new_lines.append('')
-          new_lines.append('post_install do |installer|')
-          new_lines.append('  installer.pods_project.targets.each do |target|')
-          new_lines.append('    flutter_additional_ios_build_settings(target)')
-          new_lines.append('  end')
-          new_lines.append('')
-          new_lines.append('  installer.pods_project.targets.each do |target|')
-          new_lines.append('    target.build_configurations.each do |config|')
-          new_lines.append('      config.build_settings["DEVELOPMENT_TEAM"] = "DUMMYTEAM"')
-          new_lines.append('      config.build_settings["CODE_SIGNING_ALLOWED"] = "NO"')
-          new_lines.append('    end')
-          new_lines.append('  end')
-          new_lines.append('end')
+      # --- Podfile: minimum iOS version ---
+      - name: Set iOS deployment target in Podfile
+        run: |
+          sed -i '' -E "s/^#? *platform :ios, .*/platform :ios, '${IOS_DEPLOYMENT_TARGET}'/" ios/Podfile
+          grep -q "^platform :ios" ios/Podfile || \
+            { echo "platform :ios, '${IOS_DEPLOYMENT_TARGET}'" | cat - ios/Podfile > /tmp/Podfile && mv /tmp/Podfile ios/Podfile; }
+          grep "^platform :ios" ios/Podfile
 
-          with open(podfile_path, 'w') as f:
-              f.write('\n'.join(new_lines))
-          print("Podfile patched successfully")
+      # --- Podfile: add CI settings INSIDE the existing post_install ---
+      # (CocoaPods allows only one post_install; the project's own one, incl.
+      #  its Package.swift patch, is kept.)
+      - name: Patch post_install in Podfile
+        run: |
+          python3 - <<'PYTHON'
+          path = 'ios/Podfile'
+          target = __import__('os').environ['IOS_DEPLOYMENT_TARGET']
+          ci = [
+              '  # --- added by CI: no signing for pods, iOS ' + target + ' everywhere ---',
+              '  installer.pods_project.targets.each do |t|',
+              '    t.build_configurations.each do |config|',
+              '      config.build_settings["DEVELOPMENT_TEAM"] = "DUMMYTEAM"',
+              '      config.build_settings["CODE_SIGNING_ALLOWED"] = "NO"',
+              f'      config.build_settings["IPHONEOS_DEPLOYMENT_TARGET"] = "{target}"',
+              '    end',
+              '  end',
+          ]
+          lines = open(path).read().split('\n')
+          idx = next((i for i, l in enumerate(lines) if l.strip().startswith('post_install do')), None)
+          if idx is None:
+              lines += ['', 'post_install do |installer|',
+                        '  installer.pods_project.targets.each do |t|',
+                        '    flutter_additional_ios_build_settings(t)',
+                        '  end'] + ci + ['end']
+          else:
+              # just before the block's closing "end" (after Flutter's own settings)
+              end = next(i for i in range(idx + 1, len(lines)) if lines[i].rstrip() == 'end')
+              lines[end:end] = ci
+          open(path, 'w').write('\n'.join(lines))
+          print('Podfile patched')
           PYTHON
+          sed -n '/post_install do/,$p' ios/Podfile
 
-      # --- Patch Xcode project ---
-      - name: Force disable code signing in Xcode project
+      # --- Xcode project: no code signing, same iOS target ---
+      - name: Disable code signing in Xcode project
         run: |
           PROJECT_FILE="ios/Runner.xcodeproj/project.pbxproj"
           plutil -convert json -o /tmp/project.json "$PROJECT_FILE"
-          python3 << 'PYTHON'
-          import json
-          with open('/tmp/project.json', 'r') as f:
-              data = json.load(f)
+          python3 - <<'PYTHON'
+          import json, os
+          target = os.environ['IOS_DEPLOYMENT_TARGET']
+          data = json.load(open('/tmp/project.json'))
           for obj in data.get('objects', {}).values():
               if isinstance(obj, dict) and obj.get('isa') == 'XCBuildConfiguration':
-                  if 'buildSettings' not in obj:
-                      obj['buildSettings'] = {}
-                  settings = obj['buildSettings']
-                  settings['DEVELOPMENT_TEAM'] = 'DUMMYTEAM'
-                  settings['CODE_SIGN_STYLE'] = 'Manual'
-                  settings['CODE_SIGN_IDENTITY'] = ''
-                  settings['PROVISIONING_PROFILE_SPECIFIER'] = ''
-                  settings['PROVISIONING_PROFILE'] = ''
-                  settings['CODE_SIGNING_ALLOWED'] = 'NO'
-                  settings['SWIFT_VERSION'] = '5.0'  
-          with open('/tmp/project.json', 'w') as f:
-              json.dump(data, f, indent=2)
+                  s = obj.setdefault('buildSettings', {})
+                  s['DEVELOPMENT_TEAM'] = 'DUMMYTEAM'
+                  s['CODE_SIGN_STYLE'] = 'Manual'
+                  s['CODE_SIGN_IDENTITY'] = ''
+                  s['PROVISIONING_PROFILE_SPECIFIER'] = ''
+                  s['PROVISIONING_PROFILE'] = ''
+                  s['CODE_SIGNING_ALLOWED'] = 'NO'
+                  s['SWIFT_VERSION'] = '5.0'
+                  s['IPHONEOS_DEPLOYMENT_TARGET'] = target
+          json.dump(data, open('/tmp/project.json', 'w'), indent=2)
           PYTHON
           plutil -convert xml1 -o "$PROJECT_FILE" /tmp/project.json
-          echo "Project patched successfully"
+          grep -E "DEVELOPMENT_TEAM|CODE_SIGN_STYLE|IPHONEOS_DEPLOYMENT_TARGET" "$PROJECT_FILE" | sort -u
 
-      # --- Install Pods ---
-      - name: Update CocoaPods repository with retry
+      # --- Pods ---
+      - name: Install CocoaPods dependencies (with retry)
         working-directory: ios
         run: |
-          for i in {1..3}; do
-            echo "Attempt $i: Updating CocoaPods repository..."
-            pod repo update && break
-            sleep 5
-          done
-
-      - name: Install CocoaPods dependencies with retry
-        working-directory: ios
-        run: |
-          for i in {1..5}; do
-            echo "Attempt $i: Running pod install..."
-            pod install --repo-update && break
+          for i in 1 2 3 4 5; do
+            echo "Attempt $i: pod install"
+            pod install --repo-update && exit 0
             echo "Retry in 10s..."
             sleep 10
           done
+          exit 1
 
-      # --- Build (removed the unsupported flag) ---
+      # --- Build ---
       - name: Build iOS (unsigned)
         env:
           CODE_SIGNING_ALLOWED: "NO"
           CODE_SIGN_IDENTITY: ""
         run: flutter build ios --release --no-codesign
 
-      - name: Force copy GoogleService-Info.plist into Runner.app
+      - name: Check camera permission (needed for the QR scanner)
         run: |
-          if [ -f "ios/Runner/GoogleService-Info.plist" ]; then
-            cp ios/Runner/GoogleService-Info.plist build/ios/iphoneos/Runner.app/
-            echo "✅ GoogleService-Info.plist successfully copied to Runner.app"
-          else
-            echo "❌ ERROR: GoogleService-Info.plist not found in ios/Runner/"
-            exit 1
-          fi
-      - name: Verify camera permission in Info.plist
-        run: |
-          /usr/libexec/PlistBuddy -c "Print :NSCameraUsageDescription" build/ios/iphoneos/Runner.app/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :NSCameraUsageDescription" \
+            build/ios/iphoneos/Runner.app/Info.plist \
+            || { echo "❌ NSCameraUsageDescription missing – the QR scanner would crash"; exit 1; }
 
       # --- Package IPA ---
-      - name: Create Payload and IPA
+      - name: Create IPA
         working-directory: build/ios/iphoneos
         run: |
           mkdir Payload
           mv Runner.app Payload/
-          zip -qq -r -9 ../FlutterIpaExport.ipa Payload/
-          ls -la ../FlutterIpaExport.ipa
+          zip -qq -r -9 "../${IPA_NAME}" Payload/
+          SIZE=$(stat -f%z "../${IPA_NAME}")
+          echo "📦 ${IPA_NAME}: $((SIZE / 1024 / 1024)) MB"
 
-      - name: Check IPA size
-        run: |
-          if [ -f "build/ios/FlutterIpaExport.ipa" ]; then
-            SIZE=$(stat -f%z "build/ios/FlutterIpaExport.ipa")
-            echo "IPA file size: $((SIZE / 1024 / 1024)) MB"
-          else
-            echo "ERROR: IPA file not found!"
-            exit 1
-          fi
-
-      - name: Update outdated packages (optional)
-        run: flutter pub outdated
-
-      - name: Upload IPA as Artifact
+      - name: Upload IPA as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: FlutterIpaExport.ipa
-          path: build/ios/FlutterIpaExport.ipa
+          name: ${{ env.IPA_NAME }}
+          path: build/ios/${{ env.IPA_NAME }}
           retention-days: 7
-          
+          if-no-files-found: error

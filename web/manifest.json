@@ -1,6 +1,6 @@
 {
-    "name": "lectureviewerapp",
-    "short_name": "lectureviewerapp",
+    "name": "Live Translator Viewer",
+    "short_name": "LT Viewer",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",

@@ -4,8 +4,6 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, kDebugMode;
 import 'package:web_socket_channel/web_socket_channel.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'package:audioplayers/audioplayers.dart';
@@ -40,7 +38,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   String? _selectedLanguage;
   final Set<String> _availableLanguages = {};
   final Map<String, TranscriptMessage> _messagesMap = {};
-  bool _defaultFilterSet = false;
 
   /// Language name per KIT sender ("mt:1" → "German"), asked from the
   /// server once per sender – see _lookupSenderLanguage.
@@ -56,9 +53,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   bool _isConnecting = false;
   int _reconnectAttempts = 0;
   bool _reconnectScheduled = false;
-
-  CollectionReference? _transcriptsRef;
-  String _sessionId = '';
 
   final ScrollController _scrollController = ScrollController();
 
@@ -77,18 +71,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   String? _baseUrl;
   String? _cookieString; // used for non-web fallback
   bool _redirectingToAuth = false;
-
-  bool get _isDesktop {
-    if (kIsWeb) return false;
-    switch (defaultTargetPlatform) {
-      case TargetPlatform.windows:
-      case TargetPlatform.macOS:
-      case TargetPlatform.linux:
-        return true;
-      default:
-        return false;
-    }
-  }
 
   // ============================================================
   //  Convert raw PCM to WAV (for non-web)
@@ -174,7 +156,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         : Uri.parse(widget.resolvedUrl).origin;
     debugPrint('🏠 Base URL: $_baseUrl');
 
-    _initFirebaseAndSession();
+    _initSession();
     _setupAudioListeners();
   }
 
@@ -282,33 +264,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     });
   }
 
-  Future<void> _initFirebaseAndSession() async {
-    try {
-      final user = FirebaseAuth.instance.currentUser;
-      if (user == null) await FirebaseAuth.instance.signInAnonymously();
-      final currentUser = FirebaseAuth.instance.currentUser;
-      if (currentUser != null) {
-        final prefs = await SharedPreferences.getInstance();
-        _sessionId = prefs.getString('session_id_${widget.resolvedUrl}') ??
-            DateTime.now().millisecondsSinceEpoch.toString();
-        await prefs.setString('session_id_${widget.resolvedUrl}', _sessionId);
-        _transcriptsRef = FirebaseFirestore.instance
-            .collection('users')
-            .doc(currentUser.uid)
-            .collection('sessions')
-            .doc(_sessionId)
-            .collection('transcripts');
-      }
-    } catch (e) {
-      if (_isDesktop) {
-        debugPrint('⚠️ Firebase not configured on desktop. Continuing without it.');
-      } else {
-        debugPrint('Firebase error: $e');
-        if (mounted) setState(() => _errorMessage = 'Firebase error: $e (will still try to connect)');
-      }
-      _sessionId = 'temp_${DateTime.now().millisecondsSinceEpoch}';
-    }
-
+  Future<void> _initSession() async {
     // Reuse cookies from an earlier visit or from the auth screen.
     if (!kIsWeb) {
       try {
@@ -380,7 +336,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     setState(() {
       _messagesMap.clear();
       _selectedLanguage = null;
-      _defaultFilterSet = false;
       _errorMessage = null;
       _isConnected = false;
       _isConnecting = true;
@@ -400,7 +355,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _isConnected = false;
       _isConnecting = true;
       _messagesMap.clear();
-      _defaultFilterSet = false;
       _selectedLanguage = null;
       _playingKey = null;
       _isAudioPlaying = false;
@@ -675,7 +629,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       return;
     }
     if (_availableLanguages.add(language) && mounted) {
-      setState(() => _defaultFilterSet = true);
     }
   }
 
@@ -698,25 +651,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     if (value.startsWith('http://') || value.startsWith('https://')) return true;
     if (RegExp(r'[?.:&_\-]').hasMatch(value)) return true;
     return value.startsWith('/') && value.length < 300;
-  }
-
-  /// Saves only stable (final) segments, one document per segment key, so
-  /// later corrections overwrite the document instead of adding new ones.
-  /// Unstable partial hypotheses are never written.
-  void _saveToFirestore(String key, TranscriptMessage msg) {
-    final ref = _transcriptsRef;
-    if (ref == null || msg.isUnstable) return;
-    var docId = key.replaceAll(RegExp(r'[/\s]+'), '_');
-    if (docId.length > 200) docId = docId.substring(0, 200);
-    ref.doc(docId).set({
-      'transcript': msg.transcript,
-      'translations': msg.translations,
-      'timestamp': Timestamp.fromDate(msg.timestamp),
-      'language': msg.language,
-      'isUnstable': false,
-    }).catchError((Object e) {
-      debugPrint('⚠️ Could not save to Firestore: $e');
-    });
   }
 
   // ========== MAIN MESSAGE HANDLER ==========
@@ -846,9 +780,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         debugPrint('🆕 Created new TTS message with language: $language');
       }
 
-      // Save to Firestore (optional)
-      _saveToFirestore(key, _messagesMap[key]!);
-
       if (!mounted) return;
       setState(() {
         _isConnected = true;
@@ -888,8 +819,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       audioData: null,
       audioUrl: null,
     );
-
-    _saveToFirestore(key, _messagesMap[key]!);
 
     if (!mounted) return;
     setState(() {
@@ -963,7 +892,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   Future<void> _scanNewQR() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('session_url');
-    await prefs.remove('session_id_${widget.resolvedUrl}');
     _channel?.sink.close();
     _sseSubscription?.cancel();
     _reconnectScheduled = false;

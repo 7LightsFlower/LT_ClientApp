@@ -16,9 +16,6 @@ dependencies:
   shared_preferences: ^2.5.5
   wakelock_plus: ^1.2.0          # <-- replace wakelock (deprecated)
   package_info_plus: ^10.2.1
-  firebase_core: ^4.12.1
-  firebase_auth: ^6.5.6
-  cloud_firestore: ^6.7.1
   audioplayers: ^6.8.1
   share_plus: ^13.2.1             # <-- upgrade
   path_provider: ^2.1.6
