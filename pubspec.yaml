@@ -1,5 +1,5 @@
-name: asr_live_translator
-description: Live ASR transcripts with TTS, latest output only.
+name: live_translator_viewer
+description: Live ASR transcript and translations with TTS, latest output only.
 publish_to: 'none'
 version: 1.0.0+1
 

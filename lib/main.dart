@@ -1,4 +1,4 @@
-import 'package:asr_live_translator/screens/session_selection_screen.dart';
+import 'package:live_translator_viewer/screens/session_selection_screen.dart';
 import 'package:flutter/material.dart';
 import 'screens/qr_scanner_screen.dart';
 import 'screens/live_transcript_screen.dart';

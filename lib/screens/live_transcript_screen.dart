@@ -13,7 +13,7 @@ import '../cookie_utils.dart';
 import '../language_names.dart';
 
 // Conditional import: use dart:html on web, stub elsewhere
-import 'package:asr_live_translator/web_stub.dart'
+import 'package:live_translator_viewer/web_stub.dart'
     if (dart.library.html) 'dart:html' as html;
 
 class LiveTranscriptScreen extends StatefulWidget {

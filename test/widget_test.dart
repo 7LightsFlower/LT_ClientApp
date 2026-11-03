@@ -3,8 +3,8 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:asr_live_translator/screens/session_selection_screen.dart';
-import 'package:asr_live_translator/theme_controller.dart';
+import 'package:live_translator_viewer/screens/session_selection_screen.dart';
+import 'package:live_translator_viewer/theme_controller.dart';
 
 // These tests avoid Firebase and platform plugins so they run with a plain
 // `flutter test` on any machine.
