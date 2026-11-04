@@ -25,7 +25,14 @@ class LiveItem {
     required this.order,
     this.unstable = false,
     this.speaker,
+    this.sender,
+    this.messageId,
   });
+
+  /// KIT stream ("mt:1") and its message_id – lets a spoken translation
+  /// (tts:1, min/max_message_id) find the text it speaks.
+  final String? sender;
+  final int? messageId;
 
   /// Start time in KIT's clock (seconds). Decides the position.
   final double start;
@@ -44,9 +51,22 @@ class LiveItem {
   final String? speaker;
 }
 
+/// One received segment inside a paragraph (for highlighting what is
+/// being spoken). [text] already carries its leading space.
+class DocSpan {
+  const DocSpan(this.text, {this.sender, this.messageId, this.pending = false});
+  final String text;
+  final String? sender;
+  final int? messageId;
+  final bool pending;
+}
+
 /// One block of the rendered document.
 class DocBlock {
-  const DocBlock(this.kind, this.text, {this.pending = ''});
+  const DocBlock(this.kind, this.text, {this.pending = '', this.spans = const []});
+
+  /// Paragraphs only: the segments it is made of, in order.
+  final List<DocSpan> spans;
 
   /// 'heading', 'speaker', 'para', 'summary', 'notes' or 'postedited'.
   final String kind;
@@ -97,6 +117,8 @@ class LiveDocument {
     bool unstable = false,
     String? speaker,
     double? end,
+    String? sender,
+    int? messageId,
   }) {
     final lane = _items.putIfAbsent(language, () => {});
     final previous = lane[key];
@@ -106,6 +128,8 @@ class LiveDocument {
       text: text,
       unstable: unstable,
       speaker: speaker,
+      sender: sender,
+      messageId: messageId,
       order: previous?.order ?? _order++,
     );
     firstSeen ??= DateTime.now();
@@ -140,15 +164,34 @@ class LiveDocument {
     final blocks = <DocBlock>[];
     final stable = <String>[];
     final pending = <String>[];
+    final stableItems = <LiveItem>[];
+    final pendingItems = <LiveItem>[];
     final lastBox = <String, String>{};
     var speaker = '';
 
     void flush() {
       if (stable.isEmpty && pending.isEmpty) return;
+      // Spans with the same spacing as joinRunningText.
+      final spans = <DocSpan>[];
+      String last = '';
+      void addSpans(List<String> texts, List<LiveItem> from, bool isPending) {
+        for (var i = 0; i < texts.length; i++) {
+          final t = texts[i].trim();
+          if (t.isEmpty) continue;
+          final space = last.isNotEmpty && !(_noSpace.hasMatch(last) && _noSpace.hasMatch(t[0]));
+          spans.add(DocSpan(space ? ' $t' : t,
+              sender: from[i].sender, messageId: from[i].messageId, pending: isPending));
+          last = t[t.length - 1];
+        }
+      }
+      addSpans(stable, stableItems, false);
+      addSpans(pending, pendingItems, true);
       blocks.add(DocBlock('para', joinRunningText(stable),
-          pending: joinRunningText(pending)));
+          pending: joinRunningText(pending), spans: spans));
       stable.clear();
       pending.clear();
+      stableItems.clear();
+      pendingItems.clear();
     }
 
     for (final item in items) {
@@ -197,9 +240,14 @@ class LiveDocument {
       // after it means it was replaced – drop what was pending.
       if (item.unstable) {
         pending.add(text);
+        pendingItems.add(item);
       } else {
-        if (pending.isNotEmpty) pending.clear();
+        if (pending.isNotEmpty) {
+          pending.clear();
+          pendingItems.clear();
+        }
         stable.add(text);
+        stableItems.add(item);
       }
     }
     flush();

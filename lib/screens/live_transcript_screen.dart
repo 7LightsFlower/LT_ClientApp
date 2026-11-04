@@ -62,6 +62,21 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   /// Title of exports: the session's name from the history list.
   String _sessionTitle = 'Live session';
 
+  // ── Spoken translation in the document view: one player per language ──
+  /// TTS parts per language, in arrival order.
+  final Map<String, List<TtsPart>> _ttsParts = {};
+  final AudioPlayer _ttsPlayer = AudioPlayer();
+  StreamSubscription? _ttsCompleteSub;
+  String? _ttsLanguage;
+  int? _ttsIndex;
+  bool _ttsPlaying = false;
+
+  /// The current part has played to the end.
+  bool _ttsPartFinished = false;
+
+  /// Played everything received; continues with the next part on arrival.
+  bool _ttsWaiting = false;
+
   WebSocketChannel? _channel;
   StreamSubscription? _sseSubscription;
   bool _isConnected = false;
@@ -175,6 +190,10 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     _initSession();
     _setupAudioListeners();
     _loadSessionTitle();
+    _ttsCompleteSub = _ttsPlayer.onPlayerComplete.listen((_) {
+      _ttsPartFinished = true;
+      _ttsNext(auto: true);
+    });
   }
 
   // ========== Close session ==========
@@ -373,6 +392,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _isConnecting = true;
       _messagesMap.clear();
       _doc.clear();
+      _ttsParts.clear();
       _selectedLanguage = null;
       _playingKey = null;
       _isAudioPlaying = false;
@@ -380,6 +400,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _durationMap.clear();
       _sseSessionId = null;
     });
+    _stopTts();
     if (url.startsWith('http://') || url.startsWith('https://')) {
       _connectSSE(url);
     } else {
@@ -685,6 +706,114 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
   static double _nowSeconds() => DateTime.now().millisecondsSinceEpoch / 1000.0;
 
+  static int? _toInt(Object? v) => v is num ? v.toInt() : int.tryParse(v?.toString() ?? '');
+
+  // ── Spoken translation player (document view) ──
+
+  List<TtsPart> _partsFor(String? language) =>
+      language == null ? const [] : (_ttsParts[language] ?? const []);
+
+  /// The part being played (or paused in), if any.
+  TtsPart? get _currentTtsPart {
+    final parts = _partsFor(_ttsLanguage);
+    final i = _ttsIndex;
+    if (i == null || i < 0 || i >= parts.length || _ttsPartFinished) return null;
+    return parts[i];
+  }
+
+  Future<void> _playTtsAt(String language, int index) async {
+    final parts = _partsFor(language);
+    if (index < 0 || index >= parts.length) return;
+    try {
+      await _audioPlayer.stop(); // the per-segment player of the list view
+      await _ttsPlayer.stop();
+      final bytes = parts[index].audio;
+      if (kIsWeb) {
+        await _ttsPlayer.setSourceUrl('data:audio/wav;base64,${base64Encode(bytes)}');
+      } else {
+        await _ttsPlayer.setSourceBytes(bytes);
+      }
+      if (!mounted) return;
+      setState(() {
+        _ttsLanguage = language;
+        _ttsIndex = index;
+        _ttsPlaying = true;
+        _ttsWaiting = false;
+        _ttsPartFinished = false;
+      });
+      await _ttsPlayer.resume();
+    } catch (e) {
+      debugPrint('❌ TTS playback: $e');
+      if (!mounted) return;
+      setState(() => _ttsPlaying = false);
+    }
+  }
+
+  /// Next part; at the end of what was received, wait for the next one
+  /// (only when called automatically at the end of a part).
+  void _ttsNext({bool auto = false}) {
+    final lang = _ttsLanguage;
+    final parts = _partsFor(lang);
+    final next = (_ttsIndex ?? -1) + 1;
+    if (lang != null && next < parts.length) {
+      _playTtsAt(lang, next);
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _ttsPlaying = false;
+      _ttsWaiting = auto && !_sessionEnded;
+    });
+  }
+
+  void _ttsPrevious() {
+    final lang = _ttsLanguage;
+    final i = _ttsIndex;
+    if (lang != null && i != null && i > 0) _playTtsAt(lang, i - 1);
+  }
+
+  /// Play / pause. The first play starts with the newest part (live).
+  Future<void> _ttsPlayPause(String language) async {
+    if (_ttsPlaying) {
+      await _ttsPlayer.pause();
+      if (mounted) setState(() => _ttsPlaying = false);
+      return;
+    }
+    if (_ttsWaiting) {
+      setState(() => _ttsWaiting = false);
+      return;
+    }
+    final parts = _partsFor(language);
+    if (parts.isEmpty) return;
+    if (_ttsLanguage == language && _ttsIndex != null) {
+      if (_ttsPartFinished) {
+        _ttsNext(auto: true); // next part, or wait for it
+      } else {
+        await _ttsPlayer.resume();
+        if (mounted) setState(() => _ttsPlaying = true);
+      }
+      return;
+    }
+    _playTtsAt(language, parts.length - 1);
+  }
+
+  void _stopTts() {
+    _ttsPlayer.stop();
+    _ttsLanguage = null;
+    _ttsIndex = null;
+    _ttsPlaying = false;
+    _ttsWaiting = false;
+    _ttsPartFinished = false;
+  }
+
+  /// Tap on a paragraph: play the first part that speaks it.
+  void _onParagraphTap(DocBlock paragraph) {
+    final lang = _documentLanguage();
+    final parts = _partsFor(lang);
+    final i = parts.indexWhere((p) => paragraph.spans.any(p.speaks));
+    if (lang != null && i >= 0) _playTtsAt(lang, i);
+  }
+
   /// Speaker name, if KIT sends one ("speakerName": "…:Alice" or "Alice").
   static String? _speakerOf(Map<String, dynamic> json) {
     final raw = json['speakerName'] ?? json['speaker_name'];
@@ -922,6 +1051,22 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         }
       }
 
+      // The language's player: keep the part, continue if it was waiting.
+      if (audioBytes != null) {
+        final parts = _ttsParts.putIfAbsent(language, () => []);
+        parts.add(TtsPart(
+          key: '$sender|${json['message_id']}|${json['min_message_id']}',
+          audio: audioBytes,
+          textSender: sender.replaceFirst('tts', 'mt'), // tts:N speaks mt:N
+          text: transcriptText,
+          minId: _toInt(json['min_message_id']),
+          maxId: _toInt(json['max_message_id']),
+        ));
+        if (_ttsWaiting && _ttsLanguage == language) {
+          _playTtsAt(language, parts.length - 1);
+        }
+      }
+
       // Merge with existing transcript of same language and text
       String key = '';
       bool foundMatch = false;
@@ -1012,6 +1157,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       text: transcriptText,
       unstable: isUnstable,
       speaker: _speakerOf(json),
+      sender: sender,
+      messageId: _toInt(json['message_id']),
     );
 
     if (!mounted) return;
@@ -1032,6 +1179,11 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       }
       html.window.open(message.audioUrl!, '_blank');
       return;
+    }
+
+    if (_ttsPlaying) {
+      await _ttsPlayer.pause();
+      if (mounted) setState(() => _ttsPlaying = false);
     }
 
     // Non-web: use audioplayers
@@ -1101,6 +1253,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     _sseSubscription?.cancel();
     _sseSubscription = null;
     _audioPlayer.dispose();
+    _ttsCompleteSub?.cancel();
+    _ttsPlayer.dispose();
     _scrollController.dispose();
     _httpClient.close();
     super.dispose();
@@ -1119,6 +1273,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }).toList();
 
     final docLanguage = _documentView ? _documentLanguage() : null;
+    final spokenPart = (_documentView && _ttsLanguage == docLanguage) ? _currentTtsPart : null;
+    final docParts = _partsFor(docLanguage);
 
     return PopScope(
       canPop: false,
@@ -1146,7 +1302,10 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                     child: Text(lang),
                   );
                 }).toList(),
-                onChanged: (newLang) => setState(() => _selectedLanguage = newLang),
+                onChanged: (newLang) => setState(() {
+                  if (newLang != _selectedLanguage) _stopTts();
+                  _selectedLanguage = newLang;
+                }),
               ),
             IconButton(
               icon: Icon(_documentView ? Icons.view_list : Icons.article),
@@ -1262,6 +1421,9 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                           ? const DocContent([], [])
                           : _doc.build(docLanguage),
                       controller: _scrollController,
+                      isSpoken: spokenPart == null ? null : spokenPart.speaks,
+                      spokenToken: spokenPart?.key,
+                      onParagraphTap: _partsFor(docLanguage).isEmpty ? null : _onParagraphTap,
                     )
                   : filteredKeys.isEmpty
                   ? Center(
@@ -1344,6 +1506,21 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                 },
               ),
             ),
+            if (_documentView && docLanguage != null && docParts.isNotEmpty)
+              TtsPlayerBar(
+                language: docLanguage,
+                count: docParts.length,
+                index: _ttsLanguage == docLanguage ? _ttsIndex : null,
+                playing: _ttsPlaying && _ttsLanguage == docLanguage,
+                waiting: _ttsWaiting && _ttsLanguage == docLanguage,
+                onPlayPause: () => _ttsPlayPause(docLanguage),
+                onPrevious: (_ttsLanguage == docLanguage && (_ttsIndex ?? 0) > 0) ? _ttsPrevious : null,
+                onNext: (_ttsLanguage == docLanguage &&
+                        _ttsIndex != null &&
+                        _ttsIndex! + 1 < docParts.length)
+                    ? () => _ttsNext()
+                    : null,
+              ),
           ],
         ),
       ),
