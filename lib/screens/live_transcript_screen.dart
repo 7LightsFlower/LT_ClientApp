@@ -11,9 +11,14 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../models/transcript_message.dart';
 import '../cookie_utils.dart';
 import '../language_names.dart';
+import '../live_document.dart';
+import '../live_export.dart';
+import '../widgets/live_document_view.dart';
+import 'session_selection_screen.dart' show SessionHistoryItem;
+import 'package:share_plus/share_plus.dart';
 
 // Conditional import: use dart:html on web, stub elsewhere
-import 'package:live_translator_viewer/web_stub.dart'
+import '../web_stub.dart'
     if (dart.library.html) 'dart:html' as html;
 
 class LiveTranscriptScreen extends StatefulWidget {
@@ -38,6 +43,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   String? _selectedLanguage;
   final Set<String> _availableLanguages = {};
   final Map<String, TranscriptMessage> _messagesMap = {};
+  bool _defaultFilterSet = false;
 
   /// Language name per KIT sender ("mt:1" → "German"), asked from the
   /// server once per sender – see _lookupSenderLanguage.
@@ -45,6 +51,17 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
   /// Set when KIT announces the end of the lecture ("controll": "END").
   bool _sessionEnded = false;
+
+  /// Everything received, per language, in the Session Output layout
+  /// (headings, paragraphs, summaries) – see live_document.dart.
+  final LiveDocument _doc = LiveDocument();
+
+  /// true: document view (like Session Output); false: one line per segment
+  /// with the TTS play buttons.
+  bool _documentView = true;
+
+  /// Title of exports: the session's name from the history list.
+  String _sessionTitle = 'Live session';
 
   WebSocketChannel? _channel;
   StreamSubscription? _sseSubscription;
@@ -158,6 +175,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
     _initSession();
     _setupAudioListeners();
+    _loadSessionTitle();
   }
 
   // ========== Close session ==========
@@ -336,6 +354,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     setState(() {
       _messagesMap.clear();
       _selectedLanguage = null;
+      _defaultFilterSet = false;
       _errorMessage = null;
       _isConnected = false;
       _isConnecting = true;
@@ -355,6 +374,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _isConnected = false;
       _isConnecting = true;
       _messagesMap.clear();
+      _doc.clear();
+      _defaultFilterSet = false;
       _selectedLanguage = null;
       _playingKey = null;
       _isAudioPlaying = false;
@@ -629,12 +650,19 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       return;
     }
     if (_availableLanguages.add(language) && mounted) {
+      setState(() => _defaultFilterSet = true);
     }
   }
 
   String _cleanTranscript(String raw) => raw.replaceAll(RegExp(r'<[^>]*>'), ' ');
 
   void _scrollToBottom() {
+    // Only follow the text while the reader is at the end; don't pull them
+    // away when they have scrolled up to read something.
+    if (_scrollController.hasClients) {
+      final pos = _scrollController.position;
+      if (pos.maxScrollExtent - pos.pixels > 400) return;
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_scrollController.hasClients) return;
       _scrollController.animateTo(
@@ -651,6 +679,163 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     if (value.startsWith('http://') || value.startsWith('https://')) return true;
     if (RegExp(r'[?.:&_\-]').hasMatch(value)) return true;
     return value.startsWith('/') && value.length < 300;
+  }
+
+  // ========== DOCUMENT VIEW (Session Output layout) ==========
+
+  static double? _toDouble(Object? v) =>
+      v is num ? v.toDouble() : double.tryParse(v?.toString() ?? '');
+
+  static double _nowSeconds() => DateTime.now().millisecondsSinceEpoch / 1000.0;
+
+  /// Speaker name, if KIT sends one ("speakerName": "…:Alice" or "Alice").
+  static String? _speakerOf(Map<String, dynamic> json) {
+    final raw = json['speakerName'] ?? json['speaker_name'];
+    if (raw is! String || raw.trim().isEmpty) return null;
+    final name = raw.split(':').last.trim();
+    return name.isEmpty ? null : name;
+  }
+
+  /// Language of a structure stream: "textstructurer:0_de" → German,
+  /// "…_mult57" (the multilingual one) → the original transcript's language.
+  Future<String> _structureLanguage(String sender) async {
+    final suffix = sender.contains('_') ? sender.substring(sender.lastIndexOf('_') + 1) : '';
+    if (suffix.toLowerCase().startsWith('mult')) return _languageFor('asr:0');
+    final byCode = languageNamesByCode[suffix.toLowerCase()];
+    return byCode ?? resolveLanguageName(sender);
+  }
+
+  /// textstructurer / summarizer / notes: headings, paragraph breaks and
+  /// summaries, placed by their start time into that language's document.
+  Future<void> _handleStructureMessage(String sender, Map<String, dynamic> json) async {
+    final markup = json['markup']?.toString();
+    final text = (json['seq'] ?? json['text'] ?? '').toString();
+    if (markup == null || (text.trim().isEmpty && markup != 'paragraphBreak')) return;
+    final language = await _structureLanguage(sender);
+    // A global summary is updated, not added: one per stream.
+    final key = markup == 'global_summary'
+        ? '$sender|global_summary'
+        : '$sender|$markup|${json['start']}|${json['message_id']}';
+    _doc.upsert(
+      language,
+      key,
+      start: markup == 'global_summary' ? 0.0 : (_toDouble(json['start']) ?? _nowSeconds()),
+      kind: markup,
+      text: text,
+    );
+    if (!mounted) return;
+    setState(() {});
+    if (_documentView) _scrollToBottom();
+  }
+
+  /// The language shown in the document view.
+  String? _documentLanguage() {
+    if (_selectedLanguage != null) return _selectedLanguage;
+    final langs = _doc.languages;
+    if (langs.isEmpty) return null;
+    return langs.firstWhere((l) => l.toLowerCase().startsWith('transcript'), orElse: () => langs.first);
+  }
+
+  Future<void> _loadSessionTitle() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      for (final entry in prefs.getStringList('session_history') ?? const <String>[]) {
+        final item = SessionHistoryItem.tryParse(entry);
+        if (item != null && item.url == widget.originalUrl && item.name.trim().isNotEmpty) {
+          if (mounted) setState(() => _sessionTitle = item.name.trim());
+          return;
+        }
+      }
+    } catch (e) {
+      debugPrint('Could not read the session name: $e');
+    }
+  }
+
+  /// Export sheet: language + format, then share / save the file.
+  Future<void> _showExportSheet() async {
+    final languages = _doc.languages;
+    if (languages.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Nothing to export yet.')),
+      );
+      return;
+    }
+    var language = _documentLanguage() ?? languages.first;
+    var format = ExportFormat.docx;
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setSheet) => Padding(
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Export transcript', style: Theme.of(ctx).textTheme.titleMedium),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<String>(
+                initialValue: language,
+                decoration: const InputDecoration(labelText: 'Language', border: OutlineInputBorder()),
+                items: [for (final l in languages) DropdownMenuItem(value: l, child: Text(l))],
+                onChanged: (v) => setSheet(() => language = v ?? language),
+              ),
+              const SizedBox(height: 12),
+              Wrap(
+                spacing: 8,
+                children: [
+                  for (final f in ExportFormat.values)
+                    ChoiceChip(
+                      label: Text(f.label),
+                      selected: format == f,
+                      onSelected: (_) => setSheet(() => format = f),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'File: ${exportFileName(language, format)} · what was received so far',
+                style: Theme.of(ctx).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  icon: const Icon(Icons.ios_share),
+                  label: const Text('Export'),
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    _export(language, format);
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _export(String language, ExportFormat format) async {
+    try {
+      final bytes = await buildExport(
+        format,
+        title: _sessionTitle,
+        meta: exportMetaLine(language, _doc),
+        content: _doc.build(language),
+      );
+      final name = exportFileName(language, format);
+      await SharePlus.instance.share(ShareParams(
+        files: [XFile.fromData(bytes, mimeType: format.mimeType, name: name)],
+        fileNameOverrides: [name],
+        subject: '$_sessionTitle – $language',
+      ));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Export failed: $e'), backgroundColor: Colors.red),
+      );
+    }
   }
 
   // ========== MAIN MESSAGE HANDLER ==========
@@ -675,10 +860,12 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _sessionEnded = true;
     }
 
-    // Headings, paragraph breaks and summaries – not transcript lines.
-    if (RegExp(r'^(textstructurer|summar|lip|saasr|notes)').hasMatch(sender)) {
+    // Headings, paragraph breaks, summaries, notes → the document view.
+    if (RegExp(r'^(textstructurer|summar|notes)').hasMatch(sender)) {
+      await _handleStructureMessage(sender, json);
       return;
     }
+    if (RegExp(r'^(lip|saasr)').hasMatch(sender)) return;
     final start = json['start']?.toString() ?? '';
 
     // ============================================================
@@ -819,6 +1006,16 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       audioData: null,
       audioUrl: null,
     );
+    _doc.upsert(
+      language,
+      key,
+      start: _toDouble(json['start']) ?? _nowSeconds(),
+      end: _toDouble(json['end']),
+      kind: 'text',
+      text: transcriptText,
+      unstable: isUnstable,
+      speaker: _speakerOf(json),
+    );
 
     if (!mounted) return;
     setState(() {
@@ -924,6 +1121,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
           msg.language.toLowerCase() == _selectedLanguage!.toLowerCase();
     }).toList();
 
+    final docLanguage = _documentView ? _documentLanguage() : null;
+
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (bool didPop, Object? result) async {
@@ -942,7 +1141,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
             if (_availableLanguages.isNotEmpty)
               DropdownButton<String>(
                 value: _selectedLanguage,
-                hint: const Text('All'), // Show 'All' when nothing selected
+                // Document view always shows one language; segments can show all.
+                hint: Text(_documentView ? (docLanguage ?? 'Language') : 'All'),
                 items: _availableLanguages.map((lang) {
                   return DropdownMenuItem<String>(
                     value: lang,
@@ -951,6 +1151,18 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                 }).toList(),
                 onChanged: (newLang) => setState(() => _selectedLanguage = newLang),
               ),
+            IconButton(
+              icon: Icon(_documentView ? Icons.view_list : Icons.article),
+              tooltip: _documentView
+                  ? 'Show segments (with audio)'
+                  : 'Show as document (like Session Output)',
+              onPressed: () => setState(() => _documentView = !_documentView),
+            ),
+            IconButton(
+              icon: const Icon(Icons.ios_share),
+              tooltip: 'Export (TXT, DOCX, RTF, PDF)',
+              onPressed: _showExportSheet,
+            ),
             // Manual cookie override (for non‑web debugging)
             IconButton(
               icon: const Icon(Icons.edit),
@@ -1047,7 +1259,14 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                 child: Text(_errorMessage!, style: const TextStyle(color: Colors.red)),
               ),
             Expanded(
-              child: filteredKeys.isEmpty
+              child: _documentView
+                  ? LiveDocumentView(
+                      content: docLanguage == null
+                          ? const DocContent([], [])
+                          : _doc.build(docLanguage),
+                      controller: _scrollController,
+                    )
+                  : filteredKeys.isEmpty
                   ? Center(
                 child: Text(
                   _messagesMap.isEmpty ? 'Waiting for transcript...' : 'No messages in $_selectedLanguage',
