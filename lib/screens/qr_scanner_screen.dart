@@ -131,20 +131,22 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
     try {
       resolvedUrl = await _resolveUrl(rawInput);
     } catch (e) {
-      debugPrint('❌ Could not resolve $rawInput: $e');
+      debugPrint('❌ Could not resolve $rawInput: $e'); // full reason stays in the log
       if (mounted) {
         Navigator.pop(context); // close loading dialog
-        final blockedByBrowser = kIsWeb && e is http.ClientException;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(blockedByBrowser
-                ? 'The browser blocked the request to this server (CORS). '
-                    'Try the Windows or Android version, or see the debug notes.'
-                : 'Error resolving: $e'),
-            backgroundColor: Colors.red,
-            duration: const Duration(seconds: 6),
-          ),
-        );
+        final ended = e.toString().contains('already ended');
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(
+            SnackBar(
+              content: Text(ended
+                  ? 'This session has already ended'
+                  : 'Invalid link in the QR code'),
+              backgroundColor: Colors.grey.shade800,
+              behavior: SnackBarBehavior.floating,
+              duration: const Duration(seconds: 2),
+            ),
+          );
         setState(() => _isProcessing = false);
       }
       return;
@@ -154,6 +156,7 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
 
     if (mounted) {
       Navigator.pop(context); // close loading dialog
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
       Navigator.pushReplacementNamed(
         context,
         '/live',
@@ -164,7 +167,7 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
       );
     }
   }
-  
+
   // ─── UI ─────────────────────────────────────────────────────────
 
   Widget _buildManualEntryScreen() {
@@ -231,39 +234,35 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
         controller: controller,
         onDetect: _onScanComplete,
         errorBuilder: (context, error) {
-          // This callback is called when the camera fails.
-          // Show error and offer manual entry fallback.
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text('Camera error: $error'),
-                  backgroundColor: Colors.red,
-                ),
-              );
-            }
-          });
+          // No camera / no permission: show a calm hint. The floating
+          // "Enter URL manually" button (in build()) is the way forward.
+          final noCamera = error.errorCode == MobileScannerErrorCode.unsupported;
           return Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(Icons.error_outline, size: 60, color: Colors.red),
-                const SizedBox(height: 16),
-                Text(
-                  'Camera error: $error',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.grey),
-                ),
-                const SizedBox(height: 24),
-                ElevatedButton.icon(
-                  onPressed: _showManualEntryDialog,
-                  icon: const Icon(Icons.edit),
-                  label: const Text('Enter URL manually'),
-                ),
-              ],
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.videocam_off_outlined, size: 56, color: Colors.grey.shade500),
+                  const SizedBox(height: 16),
+                  Text(
+                    noCamera
+                        ? 'No camera found on this device.'
+                        : 'The camera is not available.',
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Use "Enter URL manually" below to paste the session link.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.grey.shade600),
+                  ),
+                ],
+              ),
             ),
           );
-        },
+        },      
       );
   }
 
