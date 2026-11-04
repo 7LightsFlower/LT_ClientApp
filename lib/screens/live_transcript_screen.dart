@@ -43,7 +43,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   String? _selectedLanguage;
   final Set<String> _availableLanguages = {};
   final Map<String, TranscriptMessage> _messagesMap = {};
-  bool _defaultFilterSet = false;
 
   /// Language name per KIT sender ("mt:1" → "German"), asked from the
   /// server once per sender – see _lookupSenderLanguage.
@@ -354,7 +353,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     setState(() {
       _messagesMap.clear();
       _selectedLanguage = null;
-      _defaultFilterSet = false;
       _errorMessage = null;
       _isConnected = false;
       _isConnecting = true;
@@ -375,7 +373,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _isConnecting = true;
       _messagesMap.clear();
       _doc.clear();
-      _defaultFilterSet = false;
       _selectedLanguage = null;
       _playingKey = null;
       _isAudioPlaying = false;
@@ -650,7 +647,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       return;
     }
     if (_availableLanguages.add(language) && mounted) {
-      setState(() => _defaultFilterSet = true);
+      setState(() {}); // show the new language in the dropdown
     }
   }
 
