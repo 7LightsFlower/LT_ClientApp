@@ -1,4 +1,4 @@
-name: 0_build_7_days_test_IPA_for_iOS
+name: 1_build_7_days_test_IPA_for_iOS
 
 # Builds an UNSIGNED test IPA of LT_ClientApp ("Lectureviewerapp").
 # Sign it yourself (e.g. Sideloadly / AltStore with your Apple ID) – with a
