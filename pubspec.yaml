@@ -31,6 +31,7 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^3.0.0
+  flutter_launcher_icons: ^0.14.4
 
 flutter:
   uses-material-design: true
@@ -41,3 +42,19 @@ flutter:
     - assets/fonts/NotoSansJP-Regular.ttf      # Japanese
     - assets/fonts/NotoSansKR-Regular.ttf      # Korean
     - assets/fonts/NotoSansArabic-Regular.ttf  # Arabic / Persian
+    
+flutter_launcher_icons:
+  image_path: "assets/icon/icon.png"
+  android: true
+  ios: true
+  remove_alpha_ios: true
+  # Android adaptive icon – only if you made icon_foreground.png:
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "assets/icon/icon_foreground.png"
+  web:
+    generate: true
+  windows:
+    generate: true
+    icon_size: 256
+  macos:
+    generate: true
