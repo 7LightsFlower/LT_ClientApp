@@ -42,9 +42,9 @@ flutter:
     - assets/fonts/NotoSansJP-Regular.ttf      # Japanese
     - assets/fonts/NotoSansKR-Regular.ttf      # Korean
     - assets/fonts/NotoSansArabic-Regular.ttf  # Arabic / Persian
-    
+
 flutter_launcher_icons:
-  image_path: "assets/icon/icon.png"
+  image_path: "assets/icon/app_icon.png"
   android: true
   ios: true
   remove_alpha_ios: true
