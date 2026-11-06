@@ -48,9 +48,6 @@ flutter_launcher_icons:
   android: true
   ios: true
   remove_alpha_ios: true
-  # Android adaptive icon – only if you made icon_foreground.png:
-  adaptive_icon_background: "#FFFFFF"
-  adaptive_icon_foreground: "assets/icon/icon_foreground.png"
   web:
     generate: true
   windows:
