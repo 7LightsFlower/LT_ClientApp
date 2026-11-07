@@ -991,12 +991,20 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   Future<void> _handleStructureMessage(String sender, Map<String, dynamic> json) async {
     final markup = json['markup']?.toString();
     final text = (json['seq'] ?? json['text'] ?? '').toString();
-    if (markup == null || (text.trim().isEmpty && markup != 'paragraphBreak')) return;
+    final action = (json['action'] ?? 'add').toString();
+    if (markup == null) return;
     final language = await _structureLanguage(sender);
-    // A global summary is updated, not added: one per stream.
+    // A global summary is updated, not added: one per stream. Everything else
+    // is identified by start + end, as on KIT's page ("replace" / "remove").
     final key = markup == 'global_summary'
         ? '$sender|global_summary'
-        : '$sender|$markup|${json['start']}|${json['message_id']}';
+        : '$sender|$markup|${json['start']}|${json['end']}';
+    if (action == 'remove') {
+      _doc.remove(language, key);
+      if (mounted) setState(() {});
+      return;
+    }
+    if (text.trim().isEmpty && markup != 'paragraphBreak') return;
     _doc.upsert(
       language,
       key,
@@ -1307,22 +1315,40 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     // ============================================================
     String transcriptText = (json['text'] ?? json['seq'] ?? '').toString().trim();
     transcriptText = _cleanTranscript(transcriptText);
-    if (transcriptText.isEmpty) {
+    // Same rules as KIT's own page:
+    //  • stable text is identified by start + end; "action" can be "add"
+    //    (default), "replace" (new text for that start + end) or "remove";
+    //  • unstable text is ONE grey tail per stream, overwritten by every
+    //    unstable message and dropped when the next stable one arrives.
+    final action = (json['action'] ?? 'add').toString();
+    if (transcriptText.isEmpty && action == 'add' && !isUnstable) {
       debugPrint('⏭️ Skipping message with empty text/seq');
       return;
     }
 
     final language = await _languageFor(sender);
     _registerLanguage(language);
-    debugPrint('📝 $sender id=${json['message_id']} start=${json['start']} end=${json['end']}'
-        '${isUnstable ? ' UNSTABLE' : ''}: $transcriptText');
+    debugPrint('📝 $sender id=${json['message_id']} start=${json['start']} end=${json['end']} '
+        '$action${isUnstable ? ' UNSTABLE' : ''}: $transcriptText');
+
+    final unstableKey = '$sender|unstable';
+    if (!isUnstable) _doc.remove(language, unstableKey);
 
     String key;
-    if (start.isNotEmpty) {
-      key = '$sender|$start';
+    if (isUnstable) {
+      key = unstableKey;
+    } else if (start.isNotEmpty) {
+      key = '$sender|$start|${json['end']}';
     } else {
       final textPrefix = transcriptText.length > 20 ? transcriptText.substring(0, 20) : transcriptText;
       key = '$sender|$textPrefix';
+    }
+
+    if (action == 'remove' || (isUnstable && transcriptText.isEmpty)) {
+      _doc.remove(language, key);
+      _messagesMap.remove(key);
+      if (mounted) setState(() {});
+      return;
     }
 
     _messagesMap[key] = TranscriptMessage(

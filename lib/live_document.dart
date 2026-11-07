@@ -141,27 +141,6 @@ class LiveDocument {
     final lane = _items.putIfAbsent(language, () => {});
     final previous = lane[key];
     final ids = <int>{...?previous?.messageIds, if (messageId != null) messageId};
-    // KIT re-sends corrected text for a time span it already sent, often cut
-    // differently (other start times). The newer message replaces the older
-    // ones of the same stream that lie mostly inside its span – otherwise both
-    // versions end up mixed into each other. Unstable (still changing) text
-    // only replaces other unstable text.
-    if (kind == 'text' && sender != null && end != null && end > start) {
-      final removed = <String>[];
-      lane.forEach((k, it) {
-        if (k == key || it.kind != 'text' || it.sender != sender) return;
-        if (unstable && !it.unstable) return;
-        final os = it.start;
-        final oe = (it.end != null && it.end! > os) ? it.end! : os;
-        final startsInside = os >= start && os < end;
-        final overlap = (oe < end ? oe : end) - (os > start ? os : start);
-        final mostlyInside = oe > os && overlap > 0.5 * (oe - os);
-        if (startsInside || mostlyInside) removed.add(k);
-      });
-      for (final k in removed) {
-        ids.addAll(lane.remove(k)!.messageIds); // the audio may name the old ids
-      }
-    }
     lane[key] = LiveItem(
       start: start,
       end: end,
@@ -184,6 +163,11 @@ class LiveDocument {
     }
   }
 
+  /// Removes one item (KIT's "action": "remove", or a finished unstable tail).
+  void remove(String language, String key) {
+    if (_items[language]?.remove(key) != null) revision++;
+  }
+
   /// Length of the talk so far, or null if unknown.
   Duration? get duration {
     if (_firstStart == null || _lastEnd == null) return null;
@@ -200,6 +184,8 @@ class LiveDocument {
     final keyOf = <LiveItem, String>{for (final e in lane.entries) e.value: e.key};
     final items = lane.values.toList()
       ..sort((a, b) {
+        // Like KIT's page: text still being recognised is always the tail.
+        if (a.unstable != b.unstable) return a.unstable ? 1 : -1;
         final c = a.start.compareTo(b.start);
         return c != 0 ? c : a.order.compareTo(b.order);
       });
