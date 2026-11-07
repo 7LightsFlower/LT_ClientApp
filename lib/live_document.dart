@@ -27,7 +27,16 @@ class LiveItem {
     this.speaker,
     this.sender,
     this.messageId,
+    this.end,
+    this.messageIds = const {},
   });
+
+  /// End time (seconds), if KIT sent one.
+  final double? end;
+
+  /// Every message_id this text has had – KIT re-sends corrected text with a
+  /// new id, while the spoken audio may still name the old one.
+  final Set<int> messageIds;
 
   /// KIT stream ("mt:1") and its message_id – lets a spoken translation
   /// (tts:1, min/max_message_id) find the text it speaks.
@@ -54,8 +63,13 @@ class LiveItem {
 /// One received segment inside a paragraph (for highlighting what is
 /// being spoken). [text] already carries its leading space.
 class DocSpan {
-  const DocSpan(this.text, {this.sender, this.messageId, this.pending = false});
+  const DocSpan(this.text,
+      {this.key = '', this.sender, this.messageId, this.messageIds = const {}, this.pending = false});
   final String text;
+
+  /// The item's key in the document (stable across rebuilds).
+  final String key;
+  final Set<int> messageIds;
   final String? sender;
   final int? messageId;
   final bool pending;
@@ -88,6 +102,9 @@ class DocContent {
 class LiveDocument {
   final Map<String, Map<String, LiveItem>> _items = {};
   int _order = 0;
+
+  /// Goes up with every change (lets callers cache what they computed).
+  int revision = 0;
   double? _firstStart;
   double? _lastEnd;
 
@@ -101,6 +118,7 @@ class LiveDocument {
 
   void clear() {
     _items.clear();
+    revision++;
     _order = 0;
     _firstStart = null;
     _lastEnd = null;
@@ -122,27 +140,41 @@ class LiveDocument {
   }) {
     final lane = _items.putIfAbsent(language, () => {});
     final previous = lane[key];
-    // KIT re-sends corrected text for a time span it already sent. The newer
-    // message replaces the older ones of the same stream that start inside
-    // its span – otherwise both versions end up mixed into each other.
+    final ids = <int>{...?previous?.messageIds, if (messageId != null) messageId};
+    // KIT re-sends corrected text for a time span it already sent, often cut
+    // differently (other start times). The newer message replaces the older
+    // ones of the same stream that lie mostly inside its span – otherwise both
+    // versions end up mixed into each other. Unstable (still changing) text
+    // only replaces other unstable text.
     if (kind == 'text' && sender != null && end != null && end > start) {
-      lane.removeWhere((k, it) =>
-          k != key &&
-          it.kind == 'text' &&
-          it.sender == sender &&
-          it.start >= start &&
-          it.start < end);
+      final removed = <String>[];
+      lane.forEach((k, it) {
+        if (k == key || it.kind != 'text' || it.sender != sender) return;
+        if (unstable && !it.unstable) return;
+        final os = it.start;
+        final oe = (it.end != null && it.end! > os) ? it.end! : os;
+        final startsInside = os >= start && os < end;
+        final overlap = (oe < end ? oe : end) - (os > start ? os : start);
+        final mostlyInside = oe > os && overlap > 0.5 * (oe - os);
+        if (startsInside || mostlyInside) removed.add(k);
+      });
+      for (final k in removed) {
+        ids.addAll(lane.remove(k)!.messageIds); // the audio may name the old ids
+      }
     }
     lane[key] = LiveItem(
       start: start,
+      end: end,
       kind: kind,
       text: text,
       unstable: unstable,
       speaker: speaker,
       sender: sender,
       messageId: messageId,
+      messageIds: ids,
       order: previous?.order ?? _order++,
     );
+    revision++;
     firstSeen ??= DateTime.now();
     // Duration of the talk, from the text segments' (absolute) times only.
     if (kind == 'text' && start > 1e6) {
@@ -165,6 +197,7 @@ class LiveDocument {
     final lane = _items[language];
     if (lane == null || lane.isEmpty) return const DocContent([], []);
 
+    final keyOf = <LiveItem, String>{for (final e in lane.entries) e.value: e.key};
     final items = lane.values.toList()
       ..sort((a, b) {
         final c = a.start.compareTo(b.start);
@@ -191,7 +224,11 @@ class LiveDocument {
           if (t.isEmpty) continue;
           final space = last.isNotEmpty && !(_noSpace.hasMatch(last) && _noSpace.hasMatch(t[0]));
           spans.add(DocSpan(space ? ' $t' : t,
-              sender: from[i].sender, messageId: from[i].messageId, pending: isPending));
+              key: keyOf[from[i]] ?? '',
+              sender: from[i].sender,
+              messageId: from[i].messageId,
+              messageIds: from[i].messageIds,
+              pending: isPending));
           last = t[t.length - 1];
         }
       }

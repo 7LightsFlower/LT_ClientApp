@@ -80,9 +80,15 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   /// Played everything received; continues with the next part on arrival.
   bool _ttsWaiting = false;
 
-  /// Position / length of the part being played (progress slider).
+  /// Position in the part being played.
   Duration _ttsPosition = Duration.zero;
-  Duration _ttsDuration = Duration.zero;
+
+  /// While the user drags the progress slider (ms on the whole timeline).
+  double? _seekDrag;
+
+  /// Highlight cache: which segments the playing piece says.
+  String? _spokenCacheId;
+  Set<String> _spokenCache = const {};
 
   /// Settings panel under the top bar (audio, language, A−/A+), foldable.
   bool _panelOpen = true;
@@ -229,9 +235,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     });
     _ttsPlayer.onPositionChanged.listen((p) {
       if (mounted) setState(() => _ttsPosition = p);
-    });
-    _ttsPlayer.onDurationChanged.listen((d) {
-      if (mounted) setState(() => _ttsDuration = d);
     });
     _loadFontSize();
   }
@@ -761,7 +764,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     return parts[i];
   }
 
-  Future<void> _playTtsAt(String language, int index) async {
+  Future<void> _playTtsAt(String language, int index, {Duration offset = Duration.zero}) async {
     final parts = _partsFor(language);
     if (index < 0 || index >= parts.length) return;
     try {
@@ -776,9 +779,12 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         _ttsWaiting = false;
         _ttsPartFinished = false;
         _ttsPosition = Duration.zero;
-        _ttsDuration = Duration.zero;
       });
       await _ttsPlayer.resume();
+      if (offset > Duration.zero) {
+        await _ttsPlayer.seek(offset);
+        if (mounted) setState(() => _ttsPosition = offset);
+      }
     } catch (e) {
       debugPrint('❌ TTS playback: $e');
       if (!mounted) return;
@@ -898,9 +904,69 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   /// Tap on a paragraph: play the first part that speaks it.
   void _onParagraphTap(DocBlock paragraph) {
     final lang = _documentLanguage();
+    if (lang == null) return;
     final parts = _partsFor(lang);
-    final i = parts.indexWhere((p) => paragraph.spans.any(p.speaks));
-    if (lang != null && i >= 0) _playTtsAt(lang, i);
+    var i = parts.indexWhere((p) => paragraph.spans.any(p.speaksId));
+    if (i < 0) {
+      // Not found by id: by text.
+      final content = _doc.build(lang);
+      final keys = {for (final s in paragraph.spans) s.key};
+      i = parts.indexWhere((p) => spokenSpanKeys(content, p).any(keys.contains));
+    }
+    if (i >= 0) _playTtsAt(lang, i);
+  }
+
+  /// Segments the playing piece says (cached per piece and document change).
+  Set<String> _spokenKeys(DocContent content, TtsPart part) {
+    final id = '${part.key}#${_doc.revision}';
+    if (id != _spokenCacheId) {
+      _spokenCacheId = id;
+      _spokenCache = spokenSpanKeys(content, part);
+    }
+    return _spokenCache;
+  }
+
+  // ── One timeline for all pieces of a language ──
+
+  static Duration _sumDurations(Iterable<TtsPart> parts) =>
+      parts.fold(Duration.zero, (a, p) => a + p.duration);
+
+  /// Everything received so far, end to end.
+  Duration _timelineLength(List<TtsPart> parts) => _sumDurations(parts);
+
+  /// Where playback is on that timeline.
+  Duration _timelinePosition(String? language, List<TtsPart> parts) {
+    final i = _ttsIndex;
+    if (language == null || _ttsLanguage != language || i == null || parts.isEmpty) {
+      return Duration.zero;
+    }
+    final idx = i.clamp(0, parts.length - 1);
+    final before = _sumDurations(parts.take(idx));
+    if (_ttsPartFinished || _ttsWaiting) return before + parts[idx].duration;
+    final pos = _ttsPosition > parts[idx].duration ? parts[idx].duration : _ttsPosition;
+    return before + pos;
+  }
+
+  /// Jump to a point of the timeline: the piece there, from the right offset.
+  void _seekTimeline(String language, List<TtsPart> parts, Duration to) {
+    var rest = to;
+    for (var i = 0; i < parts.length; i++) {
+      final d = parts[i].duration;
+      if (rest < d || i == parts.length - 1) {
+        final offset = rest > d ? d : rest;
+        if (_ttsLanguage == language && _ttsIndex == i && !_ttsPartFinished && !_ttsWaiting) {
+          _ttsPlayer.seek(offset);
+          if (!_ttsPlaying) {
+            _ttsPlayer.resume();
+            setState(() => _ttsPlaying = true);
+          }
+        } else {
+          _playTtsAt(language, i, offset: offset);
+        }
+        return;
+      }
+      rest -= d;
+    }
   }
 
   /// Speaker name, if KIT sends one ("speakerName": "…:Alice" or "Alice").
@@ -1159,6 +1225,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
           }
           if (prevMax != null && prevMax + 1 <= maxId) minId = prevMax + 1;
         }
+        debugPrint('🔊 $sender id=${json['message_id']} '
+            'min=${json['min_message_id']} max=${json['max_message_id']}: $transcriptText');
         final part = TtsPart(
           key: '$sender|${json['message_id']}|$maxId',
           audio: audioBytes,
@@ -1246,6 +1314,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
     final language = await _languageFor(sender);
     _registerLanguage(language);
+    debugPrint('📝 $sender id=${json['message_id']} start=${json['start']} end=${json['end']}'
+        '${isUnstable ? ' UNSTABLE' : ''}: $transcriptText');
 
     String key;
     if (start.isNotEmpty) {
@@ -1365,8 +1435,10 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     final theme = Theme.of(context);
     final languages = <String>{..._availableLanguages, ..._doc.languages}.toList();
     final showAudio = !_isOriginal(docLanguage) && (docParts.isNotEmpty || _audioOn);
-    final total = _ttsDuration.inMilliseconds;
-    final pos = _ttsPosition.inMilliseconds.clamp(0, total > 0 ? total : 0);
+    // One growing timeline: the pieces already played stay on it.
+    final total = _timelineLength(docParts).inMilliseconds.toDouble();
+    final played = _timelinePosition(docLanguage, docParts).inMilliseconds.toDouble();
+    final pos = (_seekDrag ?? played).clamp(0.0, total > 0 ? total : 0.0);
 
     return Material(
       color: theme.colorScheme.surfaceContainerLow,
@@ -1381,12 +1453,23 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                   Expanded(
                     child: Slider(
                       value: total > 0 ? pos / total : 0,
-                      onChanged: total > 0 && _ttsLanguage == docLanguage
-                          ? (v) => _ttsPlayer.seek(Duration(milliseconds: (v * total).round()))
+                      onChanged: total > 0 && docLanguage != null
+                          ? (v) => setState(() => _seekDrag = v * total)
+                          : null,
+                      onChangeEnd: total > 0 && docLanguage != null
+                          ? (v) {
+                              setState(() => _seekDrag = null);
+                              _seekTimeline(docLanguage, docParts,
+                                  Duration(milliseconds: (v * total).round()));
+                            }
                           : null,
                     ),
                   ),
-                  Text(_mmss(_ttsPosition), style: theme.textTheme.titleSmall),
+                  Text(
+                    '${_mmss(Duration(milliseconds: pos.round()))} / '
+                    '${_mmss(Duration(milliseconds: total.round()))}',
+                    style: theme.textTheme.titleSmall,
+                  ),
                 ],
               ),
             if (languages.isNotEmpty && docLanguage != null)
@@ -1447,6 +1530,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     final docLanguage = _documentView ? _documentLanguage() : null;
     final spokenPart = (_documentView && _ttsLanguage == docLanguage) ? _currentTtsPart : null;
     final docParts = _partsFor(docLanguage);
+    final docContent = docLanguage == null ? const DocContent([], []) : _doc.build(docLanguage);
+    final spokenKeys = spokenPart == null ? null : _spokenKeys(docContent, spokenPart);
 
     return PopScope(
       canPop: false,
@@ -1526,11 +1611,9 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
             Expanded(
               child: _documentView
                   ? LiveDocumentView(
-                      content: docLanguage == null
-                          ? const DocContent([], [])
-                          : _doc.build(docLanguage),
+                      content: docContent,
                       controller: _scrollController,
-                      isSpoken: spokenPart == null ? null : spokenPart.speaks,
+                      isSpoken: spokenKeys == null ? null : (s) => spokenKeys.contains(s.key),
                       spokenToken: spokenPart?.key,
                       onParagraphTap: _partsFor(docLanguage).isEmpty ? null : _onParagraphTap,
                       fontSize: _fontSize,

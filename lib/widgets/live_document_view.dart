@@ -197,28 +197,127 @@ class TtsPart {
     required this.text,
     this.minId,
     this.maxId,
-  });
+  }) : duration = wavDuration(audio);
 
   final String key;
 
   /// WAV bytes.
   final Uint8List audio;
 
+  /// Length of [audio].
+  final Duration duration;
+
   /// The text stream it speaks ("mt:1" for "tts:1").
   final String textSender;
+
+  /// What it says.
   final String text;
 
-  /// KIT's min/max_message_id: which messages of [textSender] it speaks.
+  /// Which messages of [textSender] it speaks (KIT's message ids).
   final int? minId;
   final int? maxId;
 
-  bool speaks(DocSpan s) =>
-      s.sender == textSender &&
-      s.messageId != null &&
-      minId != null &&
-      s.messageId! >= minId! &&
-      s.messageId! <= (maxId ?? minId!);
+  bool speaksId(DocSpan s) {
+    if (s.sender != textSender || minId == null) return false;
+    final hi = maxId ?? minId!;
+    bool inRange(int id) => id >= minId! && id <= hi;
+    return (s.messageId != null && inRange(s.messageId!)) || s.messageIds.any(inRange);
+  }
+
+  /// Same as [speaksId] (used when no document is at hand).
+  bool speaks(DocSpan s) => speaksId(s);
 }
+
+/// Length of a PCM WAV (reads the header).
+Duration wavDuration(Uint8List wav) {
+  if (wav.length < 44) return Duration.zero;
+  final h = ByteData.sublistView(wav);
+  final channels = h.getUint16(22, Endian.little);
+  final rate = h.getUint32(24, Endian.little);
+  final bits = h.getUint16(34, Endian.little);
+  final bytesPerSecond = rate * channels * (bits ~/ 8);
+  if (bytesPerSecond <= 0) return Duration.zero;
+  return Duration(microseconds: ((wav.length - 44) * 1000000 / bytesPerSecond).round());
+}
+
+/// The paragraph segments a spoken piece says, as span keys.
+///
+/// Matches the piece's text with the segments' text: KIT's message ids alone
+/// miss text that was corrected or cut differently after the audio was made.
+/// The ids only decide which place in the document is meant when the same
+/// words occur more than once.
+Set<String> spokenSpanKeys(DocContent content, TtsPart part) {
+  final spans = <DocSpan>[
+    for (final b in content.blocks)
+      if (b.kind == 'para')
+        for (final s in b.spans)
+          if (!s.pending && s.sender == part.textSender) s,
+  ];
+  if (spans.isEmpty) return const {};
+  final spoken = _words(part.text);
+  final anchors = <int>[
+    for (var i = 0; i < spans.length; i++)
+      if (part.speaksId(spans[i])) i,
+  ];
+
+  // Segments whose words are (mostly) in the spoken text.
+  final hit = List<bool>.filled(spans.length, false);
+  final score = List<int>.filled(spans.length, 0);
+  final hasWords = List<bool>.filled(spans.length, false);
+  for (var i = 0; i < spans.length; i++) {
+    final w = _words(spans[i].text);
+    if (w.isEmpty) continue;
+    hasWords[i] = true;
+    final found = w.where(spoken.contains).length;
+    score[i] = found;
+    hit[i] = spoken.isNotEmpty && found / w.length >= 0.6;
+  }
+
+  // Runs of neighbouring matching segments; pick the best one.
+  final runs = <List<int>>[];
+  for (var i = 0; i < spans.length; i++) {
+    if (!hit[i]) continue;
+    if (runs.isNotEmpty) {
+      // Neighbour if only word-less segments lie in between.
+      var j = runs.last.last + 1;
+      while (j < i && !hasWords[j]) {
+        j++;
+      }
+      if (j == i) {
+        runs.last.add(i);
+        continue;
+      }
+    }
+    runs.add([i]);
+  }
+  if (runs.isEmpty) {
+    return {for (final i in anchors) spans[i].key};
+  }
+  int runScore(List<int> r) => r.fold(0, (a, i) => a + score[i]);
+  int distance(List<int> r) {
+    if (anchors.isEmpty) return 0;
+    var best = 1 << 30;
+    for (final a in anchors) {
+      final d = a < r.first ? r.first - a : (a > r.last ? a - r.last : 0);
+      if (d < best) best = d;
+    }
+    return best;
+  }
+
+  List<int> best = runs.first;
+  for (final r in runs.skip(1)) {
+    final dr = distance(r), db = distance(best);
+    final sr = runScore(r), sb = runScore(best);
+    // Closest to KIT's ids first, then most words; later wins a tie (live).
+    if (dr < db || (dr == db && sr >= sb)) best = r;
+  }
+  return {for (final i in best) spans[i].key};
+}
+
+final RegExp _wordRe = RegExp(r'[\p{L}\p{N}]+', unicode: true);
+
+Set<String> _words(String text) =>
+    {for (final m in _wordRe.allMatches(text.toLowerCase())) m.group(0)!};
 
 /// Player bar for the spoken translation of one language.
 class TtsPlayerBar extends StatelessWidget {
