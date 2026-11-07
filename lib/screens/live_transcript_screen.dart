@@ -60,7 +60,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
   /// true: document view (like Session Output); false: one line per segment
   /// with the TTS play buttons.
-  bool _documentView = true;
+  final bool _documentView = true;
 
   /// Title of exports: the session's name from the history list.
   String _sessionTitle = 'Live session';
@@ -1031,7 +1031,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       String? audioUrl;
       final audioField = (json['b64_enc_pcm_s16le'] as String?)?.trim();
       // KIT sends no rate for raw TTS PCM. Its voices are 16 kHz: at that rate
-      // the pieces have a natural speaking pace (24 kHz played 1.5× too fast).      final sampleRate = (json['sample_rate'] as num?)?.toInt() ?? 16000;
+      // the pieces have a natural speaking pace (24 kHz played 1.5× too fast).
+      final sampleRate = (json['sample_rate'] as num?)?.toInt() ?? 16000;
       if (audioField != null && audioField.isNotEmpty && !_looksLikeAudioUrl(audioField)) {
         // Inline audio: base64-encoded 16-bit little-endian PCM.
         try {
@@ -1339,18 +1340,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                 }),
               ),
             IconButton(
-              icon: Icon(_documentView ? Icons.view_list : Icons.article),
-              tooltip: _documentView
-                  ? 'Show segments (with audio)'
-                  : 'Show as document (like Session Output)',
-              onPressed: () => setState(() => _documentView = !_documentView),
-            ),
-            IconButton(
-              icon: const Icon(Icons.ios_share),
-              tooltip: 'Export (TXT, DOCX, RTF, PDF)',
-              onPressed: _showExportSheet,
-            ),
-            IconButton(
               icon: const Icon(Icons.qr_code_2),
               tooltip: 'Show QR code to share this session',
               onPressed: () => showSessionQrDialog(
@@ -1363,6 +1352,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
               icon: const Icon(Icons.more_vert),
               onSelected: (value) {
                 if (value == 'scan') _scanNewQR();
+                if (value == 'export') _showExportSheet();
                 if (value == 'cookie') _showCookieDialog();
               },
               itemBuilder: (context) => [
@@ -1373,6 +1363,16 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                       Icon(Icons.qr_code_scanner),
                       SizedBox(width: 8),
                       Text('Scan new QR'),
+                    ],
+                  ),
+                ),
+                const PopupMenuItem<String>(
+                  value: 'export',
+                  child: Row(
+                    children: [
+                      Icon(Icons.ios_share),
+                      SizedBox(width: 8),
+                      Text('Export transcript'),
                     ],
                   ),
                 ),
@@ -1392,51 +1392,39 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         ),
         body: Column(
           children: [
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              color: _isConnected ? Colors.green.shade100 : Colors.red.shade100,
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Row(
-                    children: [
-                      Icon(
-                        _isConnected ? Icons.wifi : (_isConnecting ? Icons.wifi_lock : Icons.wifi_off),
-                        color: _isConnected ? Colors.green : (_isConnecting ? Colors.orange : Colors.red),
+            // Only shown when something is wrong; a live connection needs no bar.
+            if (!_isConnected || _errorMessage != null)
+              Container(
+                width: double.infinity,
+                color: _isConnecting
+                    ? Theme.of(context).colorScheme.surfaceContainerHighest
+                    : Theme.of(context).colorScheme.errorContainer,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                child: Row(
+                  children: [
+                    if (_isConnecting)
+                      const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    else
+                      const Icon(Icons.wifi_off, size: 18),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        _isConnecting ? 'Connecting…' : (_errorMessage ?? 'Disconnected'),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
                       ),
-                      const SizedBox(width: 8),
-                      Text(_isConnected ? 'Live connection' : (_isConnecting ? 'Connecting...' : 'Disconnected')),
-                      if (_selectedLanguage != null) ...[
-                        const SizedBox(width: 12),
-                        Chip(
-                          label: Text('Filter: $_selectedLanguage'),
-                          backgroundColor: Colors.blue.shade100,
-                          deleteIcon: const Icon(Icons.close, size: 16),
-                          onDeleted: () => setState(() => _selectedLanguage = null),
-                        ),
-                      ],
-                    ],
-                  ),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (!_isConnected && !_isConnecting)
-                        TextButton(onPressed: () => _reconnect(manual: true), child: const Text('Retry')),
-                      TextButton.icon(
-                        onPressed: () => _closeSession(showConfirmation: true),
-                        icon: const Icon(Icons.close, size: 18),
-                        label: const Text('Close'),
-                        style: TextButton.styleFrom(foregroundColor: Colors.red),
+                    ),
+                    if (!_isConnected && !_isConnecting)
+                      TextButton(
+                        onPressed: () => _reconnect(manual: true),
+                        child: const Text('Retry'),
                       ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            if (_errorMessage != null)
-              Padding(
-                padding: const EdgeInsets.all(8.0),
-                child: Text(_errorMessage!, style: const TextStyle(color: Colors.red)),
+                  ],
+                ),
               ),
             Expanded(
               child: _documentView
@@ -1445,7 +1433,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                           ? const DocContent([], [])
                           : _doc.build(docLanguage),
                       controller: _scrollController,
-                      isSpoken: spokenPart?.speaks,
+                      isSpoken: spokenPart == null ? null : spokenPart.speaks,
                       spokenToken: spokenPart?.key,
                       onParagraphTap: _partsFor(docLanguage).isEmpty ? null : _onParagraphTap,
                     )
