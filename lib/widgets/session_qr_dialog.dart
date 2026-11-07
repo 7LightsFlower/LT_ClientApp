@@ -4,6 +4,7 @@
 // it with this app (or any camera app), and lets you share the QR code as an
 // image, share the link as text, or copy it.
 
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';

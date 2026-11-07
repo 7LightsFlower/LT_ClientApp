@@ -80,6 +80,17 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   /// Played everything received; continues with the next part on arrival.
   bool _ttsWaiting = false;
 
+  /// Position / length of the part being played (progress slider).
+  Duration _ttsPosition = Duration.zero;
+  Duration _ttsDuration = Duration.zero;
+
+  /// Settings panel under the top bar (audio, language, A−/A+), foldable.
+  bool _panelOpen = true;
+
+  /// Size of the running text, remembered between sessions.
+  double _fontSize = 17;
+  static const String _fontSizePref = 'live_font_size';
+
   WebSocketChannel? _channel;
   StreamSubscription? _sseSubscription;
   bool _isConnected = false;
@@ -216,6 +227,13 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _ttsPartFinished = true;
       _ttsNext(auto: true);
     });
+    _ttsPlayer.onPositionChanged.listen((p) {
+      if (mounted) setState(() => _ttsPosition = p);
+    });
+    _ttsPlayer.onDurationChanged.listen((d) {
+      if (mounted) setState(() => _ttsDuration = d);
+    });
+    _loadFontSize();
   }
 
   // ========== Close session ==========
@@ -757,6 +775,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         _ttsPlaying = true;
         _ttsWaiting = false;
         _ttsPartFinished = false;
+        _ttsPosition = Duration.zero;
+        _ttsDuration = Duration.zero;
       });
       await _ttsPlayer.resume();
     } catch (e) {
@@ -781,12 +801,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _ttsPlaying = false;
       _ttsWaiting = auto && !_sessionEnded;
     });
-  }
-
-  void _ttsPrevious() {
-    final lang = _ttsLanguage;
-    final i = _ttsIndex;
-    if (lang != null && i != null && i > 0) _playTtsAt(lang, i - 1);
   }
 
   /// Play / pause. The first play starts with the newest part (live).
@@ -822,6 +836,64 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     _ttsWaiting = false;
     _ttsPartFinished = false;
   }
+
+  /// The original transcript has no spoken version.
+  bool _isOriginal(String? language) =>
+      language == null || language.toLowerCase().startsWith('transcript');
+
+  bool get _audioOn => _ttsPlaying || _ttsWaiting;
+
+  /// Speaker button in the top bar: audio on (live) / off.
+  Future<void> _toggleAudio() async {
+    final lang = _documentLanguage();
+    if (lang == null || _isOriginal(lang)) return;
+    if (_audioOn) {
+      await _ttsPlayer.pause();
+      if (mounted) {
+        setState(() {
+          _ttsPlaying = false;
+          _ttsWaiting = false;
+        });
+      }
+      return;
+    }
+    if (_partsFor(lang).isEmpty) {
+      // Starts by itself as soon as the first piece arrives.
+      setState(() {
+        _ttsLanguage = lang;
+        _ttsIndex = null;
+        _ttsWaiting = true;
+      });
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(const SnackBar(
+          content: Text('Waiting for audio. Play will be available once translation audio is buffered.'),
+          duration: Duration(seconds: 3),
+        ));
+      return;
+    }
+    await _ttsPlayPause(lang);
+  }
+
+  Future<void> _loadFontSize() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final v = prefs.getDouble(_fontSizePref);
+      if (v != null && mounted) setState(() => _fontSize = v);
+    } catch (_) {}
+  }
+
+  Future<void> _changeFontSize(double delta) async {
+    final v = (_fontSize + delta).clamp(12.0, 34.0);
+    setState(() => _fontSize = v);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble(_fontSizePref, v);
+    } catch (_) {}
+  }
+
+  static String _mmss(Duration d) =>
+      '${d.inMinutes.toString().padLeft(2, '0')}:${(d.inSeconds % 60).toString().padLeft(2, '0')}';
 
   /// Tap on a paragraph: play the first part that speaks it.
   void _onParagraphTap(DocBlock paragraph) {
@@ -1247,37 +1319,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }
   }
 
-  /// Manual cookie override (for non‑web debugging).
-  void _showCookieDialog() {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Set Cookie'),
-        content: TextField(
-          onChanged: (value) => _cookieString = value,
-          decoration: const InputDecoration(labelText: 'Cookie string'),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Save'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Future<void> _scanNewQR() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove('session_url');
-    _channel?.sink.close();
-    _sseSubscription?.cancel();
-    _reconnectScheduled = false;
-    await _audioPlayer.stop();
-    if (!mounted) return;
-    Navigator.pushReplacementNamed(context, '/scan');
-  }
-
   @override
   void dispose() {
     _reconnectScheduled = false;
@@ -1290,6 +1331,78 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     _scrollController.dispose();
     _httpClient.close();
     super.dispose();
+  }
+
+  /// Foldable panel: audio progress (languages with speech), language, A−/A+.
+  Widget _buildPanel(String? docLanguage, List<TtsPart> docParts) {
+    final theme = Theme.of(context);
+    final languages = <String>{..._availableLanguages, ..._doc.languages}.toList();
+    final showAudio = !_isOriginal(docLanguage) && (docParts.isNotEmpty || _audioOn);
+    final total = _ttsDuration.inMilliseconds;
+    final pos = _ttsPosition.inMilliseconds.clamp(0, total > 0 ? total : 0);
+
+    return Material(
+      color: theme.colorScheme.surfaceContainerLow,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (showAudio)
+              Row(
+                children: [
+                  Expanded(
+                    child: Slider(
+                      value: total > 0 ? pos / total : 0,
+                      onChanged: total > 0 && _ttsLanguage == docLanguage
+                          ? (v) => _ttsPlayer.seek(Duration(milliseconds: (v * total).round()))
+                          : null,
+                    ),
+                  ),
+                  Text(_mmss(_ttsPosition), style: theme.textTheme.titleSmall),
+                ],
+              ),
+            if (languages.isNotEmpty && docLanguage != null)
+              InputDecorator(
+                decoration: const InputDecoration(labelText: 'Language'),
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<String>(
+                    value: docLanguage,
+                    isExpanded: true,
+                    isDense: true,
+                    style: theme.textTheme.titleLarge,
+                    items: [
+                      for (final l in languages) DropdownMenuItem(value: l, child: Text(l)),
+                    ],
+                    onChanged: (l) => setState(() {
+                      if (l != docLanguage) _stopTts();
+                      _selectedLanguage = l;
+                    }),
+                  ),
+                ),
+              ),
+            Row(
+              children: [
+                TextButton(
+                  onPressed: _fontSize > 12 ? () => _changeFontSize(-2) : null,
+                  child: const Text('A−', style: TextStyle(fontSize: 18)),
+                ),
+                TextButton(
+                  onPressed: _fontSize < 34 ? () => _changeFontSize(2) : null,
+                  child: const Text('A+', style: TextStyle(fontSize: 18)),
+                ),
+                const Spacer(),
+                IconButton(
+                  icon: const Icon(Icons.ios_share),
+                  tooltip: 'Export transcript (TXT, DOCX, RTF, PDF)',
+                  onPressed: _showExportSheet,
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   // ========== BUILD ==========
@@ -1317,28 +1430,12 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         appBar: AppBar(
           automaticallyImplyLeading: false,
           leading: IconButton(
-            icon: const Icon(Icons.close),
+            icon: const Icon(Icons.arrow_back_ios_new),
             onPressed: () => _closeSession(showConfirmation: true),
             tooltip: 'Leave session',
           ),
-          title: const Text('Live Transcript'),
+          title: Text(_sessionTitle, overflow: TextOverflow.ellipsis),
           actions: [
-            if (_availableLanguages.isNotEmpty)
-              DropdownButton<String>(
-                value: _selectedLanguage,
-                // Document view always shows one language; segments can show all.
-                hint: Text(_documentView ? (docLanguage ?? 'Language') : 'All'),
-                items: _availableLanguages.map((lang) {
-                  return DropdownMenuItem<String>(
-                    value: lang,
-                    child: Text(lang),
-                  );
-                }).toList(),
-                onChanged: (newLang) => setState(() {
-                  if (newLang != _selectedLanguage) _stopTts();
-                  _selectedLanguage = newLang;
-                }),
-              ),
             IconButton(
               icon: const Icon(Icons.qr_code_2),
               tooltip: 'Show QR code to share this session',
@@ -1348,50 +1445,23 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                 title: _sessionTitle,
               ),
             ),
-            PopupMenuButton<String>(
-              icon: const Icon(Icons.more_vert),
-              onSelected: (value) {
-                if (value == 'scan') _scanNewQR();
-                if (value == 'export') _showExportSheet();
-                if (value == 'cookie') _showCookieDialog();
-              },
-              itemBuilder: (context) => [
-                const PopupMenuItem<String>(
-                  value: 'scan',
-                  child: Row(
-                    children: [
-                      Icon(Icons.qr_code_scanner),
-                      SizedBox(width: 8),
-                      Text('Scan new QR'),
-                    ],
-                  ),
-                ),
-                const PopupMenuItem<String>(
-                  value: 'export',
-                  child: Row(
-                    children: [
-                      Icon(Icons.ios_share),
-                      SizedBox(width: 8),
-                      Text('Export transcript'),
-                    ],
-                  ),
-                ),
-                const PopupMenuItem<String>(
-                  value: 'cookie',
-                  child: Row(
-                    children: [
-                      Icon(Icons.edit),
-                      SizedBox(width: 8),
-                      Text('Set cookie (debug)'),
-                    ],
-                  ),
-                ),
-              ],
+            IconButton(
+              icon: Icon(_audioOn ? Icons.volume_up : Icons.volume_off),
+              tooltip: _isOriginal(docLanguage)
+                  ? 'The original has no spoken version'
+                  : (_audioOn ? 'Audio off' : 'Listen to the spoken translation'),
+              onPressed: _isOriginal(docLanguage) ? null : _toggleAudio,
+            ),
+            IconButton(
+              icon: Icon(_panelOpen ? Icons.expand_less : Icons.expand_more),
+              tooltip: _panelOpen ? 'Hide settings' : 'Show settings',
+              onPressed: () => setState(() => _panelOpen = !_panelOpen),
             ),
           ],
         ),
         body: Column(
           children: [
+            if (_panelOpen) _buildPanel(docLanguage, docParts),
             // Only shown when something is wrong; a live connection needs no bar.
             if (!_isConnected || _errorMessage != null)
               Container(
@@ -1436,6 +1506,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                       isSpoken: spokenPart == null ? null : spokenPart.speaks,
                       spokenToken: spokenPart?.key,
                       onParagraphTap: _partsFor(docLanguage).isEmpty ? null : _onParagraphTap,
+                      fontSize: _fontSize,
                     )
                   : filteredKeys.isEmpty
                   ? Center(
@@ -1518,21 +1589,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                 },
               ),
             ),
-            if (_documentView && docLanguage != null && docParts.isNotEmpty)
-              TtsPlayerBar(
-                language: docLanguage,
-                count: docParts.length,
-                index: _ttsLanguage == docLanguage ? _ttsIndex : null,
-                playing: _ttsPlaying && _ttsLanguage == docLanguage,
-                waiting: _ttsWaiting && _ttsLanguage == docLanguage,
-                onPlayPause: () => _ttsPlayPause(docLanguage),
-                onPrevious: (_ttsLanguage == docLanguage && (_ttsIndex ?? 0) > 0) ? _ttsPrevious : null,
-                onNext: (_ttsLanguage == docLanguage &&
-                        _ttsIndex != null &&
-                        _ttsIndex! + 1 < docParts.length)
-                    ? () => _ttsNext()
-                    : null,
-              ),
           ],
         ),
       ),

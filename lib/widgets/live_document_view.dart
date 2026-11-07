@@ -22,7 +22,11 @@ class LiveDocumentView extends StatefulWidget {
     this.isSpoken,
     this.spokenToken,
     this.onParagraphTap,
+    this.fontSize = 17,
   });
+
+  /// Size of the running text (A− / A+).
+  final double fontSize;
 
   final DocContent content;
   final ScrollController controller;
@@ -74,7 +78,7 @@ class _LiveDocumentViewState extends State<LiveDocumentView> {
     final blue = dark ? const Color(0xFF90CAF9) : const Color(0xFF1565C0);
     final green = dark ? const Color(0xFFA5D6A7) : const Color(0xFF2E7D32);
     final highlight = dark ? const Color(0x66FFD54F) : const Color(0xFFFFF59D);
-    final body = theme.textTheme.bodyLarge?.copyWith(fontSize: 17, height: 1.45);
+    final body = theme.textTheme.bodyLarge?.copyWith(fontSize: widget.fontSize, height: 1.45);
     final pendingStyle = body?.copyWith(color: theme.colorScheme.onSurface.withValues(alpha: 0.45));
 
     final children = <Widget>[];
@@ -96,7 +100,7 @@ class _LiveDocumentViewState extends State<LiveDocumentView> {
                 style: theme.textTheme.labelLarge?.copyWith(color: purple, fontWeight: FontWeight.bold)),
             const SizedBox(height: 6),
             for (final g in content.globalSummaries)
-              Text(g, style: body?.copyWith(fontStyle: FontStyle.italic, color: purple, fontSize: 15)),
+              Text(g, style: body?.copyWith(fontStyle: FontStyle.italic, color: purple, fontSize: widget.fontSize - 2)),
           ],
         ),
       ));
@@ -164,7 +168,7 @@ class _LiveDocumentViewState extends State<LiveDocumentView> {
               border: Border(left: BorderSide(color: green, width: 3)),
             ),
             child: Text.rich(TextSpan(
-              style: body?.copyWith(fontSize: 15),
+              style: body?.copyWith(fontSize: widget.fontSize - 2),
               children: [
                 TextSpan(text: '$label: ', style: TextStyle(color: green, fontWeight: FontWeight.bold)),
                 TextSpan(text: b.text, style: const TextStyle(fontStyle: FontStyle.italic)),
