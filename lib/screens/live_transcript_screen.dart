@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
+import 'dart:io' show File;
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, kDebugMode;
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -8,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:path_provider/path_provider.dart';
 import '../models/transcript_message.dart';
 import '../cookie_utils.dart';
 import '../language_names.dart';
@@ -145,6 +147,25 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
     wavBytes.setRange(offset, offset + pcmData.length, pcmData);
     return wavBytes;
+  }
+
+  /// Loads WAV bytes into [player] in a way every platform accepts.
+  /// iOS/macOS (AVPlayer) must be told the format and is most reliable with
+  /// a real .wav file; the web plays a data: URL.
+  Future<void> _setWavSource(AudioPlayer player, Uint8List wav, String id) async {
+    if (kIsWeb) {
+      await player.setSourceUrl('data:audio/wav;base64,${base64Encode(wav)}');
+      return;
+    }
+    if (defaultTargetPlatform == TargetPlatform.iOS ||
+        defaultTargetPlatform == TargetPlatform.macOS) {
+      final dir = await getTemporaryDirectory();
+      final file = File('${dir.path}/tts_${id.hashCode.toUnsigned(32)}.wav');
+      if (!await file.exists()) await file.writeAsBytes(wav, flush: true);
+      await player.setSourceDeviceFile(file.path, mimeType: 'audio/wav');
+      return;
+    }
+    await player.setSourceBytes(wav, mimeType: 'audio/wav');
   }
 
   /// /webapi/stream/data answers with JSON that carries the audio as base64
@@ -727,12 +748,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     try {
       await _audioPlayer.stop(); // the per-segment player of the list view
       await _ttsPlayer.stop();
-      final bytes = parts[index].audio;
-      if (kIsWeb) {
-        await _ttsPlayer.setSourceUrl('data:audio/wav;base64,${base64Encode(bytes)}');
-      } else {
-        await _ttsPlayer.setSourceBytes(bytes);
-      }
+      await _setWavSource(_ttsPlayer, parts[index].audio, parts[index].key);
       if (!mounted) return;
       setState(() {
         _ttsLanguage = language;
@@ -1213,12 +1229,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }
 
     try {
-      if (kIsWeb) {
-        // Inline audio on web: play it as a data: URL in the browser.
-        await _audioPlayer.setSourceUrl('data:audio/wav;base64,${base64Encode(message.audioData!)}');
-      } else {
-        await _audioPlayer.setSourceBytes(message.audioData!);
-      }
+      await _setWavSource(_audioPlayer, message.audioData!, key);
       await _audioPlayer.resume();
       if (!mounted) return;
       setState(() {
