@@ -16,6 +16,7 @@ import '../language_names.dart';
 import '../live_document.dart';
 import '../live_export.dart';
 import '../widgets/live_document_view.dart';
+import '../widgets/session_qr_dialog.dart';
 import 'session_selection_screen.dart' show SessionHistoryItem;
 import 'package:share_plus/share_plus.dart';
 
@@ -1246,6 +1247,26 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }
   }
 
+  /// Manual cookie override (for non‑web debugging).
+  void _showCookieDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Set Cookie'),
+        content: TextField(
+          onChanged: (value) => _cookieString = value,
+          decoration: const InputDecoration(labelText: 'Cookie string'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _scanNewQR() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('session_url');
@@ -1330,37 +1351,20 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
               tooltip: 'Export (TXT, DOCX, RTF, PDF)',
               onPressed: _showExportSheet,
             ),
-            // Manual cookie override (for non‑web debugging)
             IconButton(
-              icon: const Icon(Icons.edit),
-              onPressed: () {
-                showDialog(
-                  context: context,
-                  builder: (context) => AlertDialog(
-                    title: const Text('Set Cookie'),
-                    content: TextField(
-                      onChanged: (value) {
-                        _cookieString = value;
-                      },
-                      decoration: const InputDecoration(labelText: 'Cookie string'),
-                    ),
-                    actions: [
-                      TextButton(
-                        onPressed: () {
-                          Navigator.pop(context);
-                        },
-                        child: const Text('Save'),
-                      ),
-                    ],
-                  ),
-                );
-              },
-              tooltip: 'Manually set cookie (non‑web)',
+              icon: const Icon(Icons.qr_code_2),
+              tooltip: 'Show QR code to share this session',
+              onPressed: () => showSessionQrDialog(
+                context,
+                link: widget.originalUrl ?? widget.resolvedUrl,
+                title: _sessionTitle,
+              ),
             ),
             PopupMenuButton<String>(
               icon: const Icon(Icons.more_vert),
               onSelected: (value) {
                 if (value == 'scan') _scanNewQR();
+                if (value == 'cookie') _showCookieDialog();
               },
               itemBuilder: (context) => [
                 const PopupMenuItem<String>(
@@ -1370,6 +1374,16 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                       Icon(Icons.qr_code_scanner),
                       SizedBox(width: 8),
                       Text('Scan new QR'),
+                    ],
+                  ),
+                ),
+                const PopupMenuItem<String>(
+                  value: 'cookie',
+                  child: Row(
+                    children: [
+                      Icon(Icons.edit),
+                      SizedBox(width: 8),
+                      Text('Set cookie (debug)'),
                     ],
                   ),
                 ),
@@ -1432,7 +1446,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                           ? const DocContent([], [])
                           : _doc.build(docLanguage),
                       controller: _scrollController,
-                      isSpoken: spokenPart == null ? null : spokenPart.speaks,
+                      isSpoken: spokenPart?.speaks,
                       spokenToken: spokenPart?.key,
                       onParagraphTap: _partsFor(docLanguage).isEmpty ? null : _onParagraphTap,
                     )
