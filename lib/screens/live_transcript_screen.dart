@@ -1503,7 +1503,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                           ? const DocContent([], [])
                           : _doc.build(docLanguage),
                       controller: _scrollController,
-                      isSpoken: spokenPart == null ? null : spokenPart.speaks,
+                      isSpoken: spokenPart?.speaks,
                       spokenToken: spokenPart?.key,
                       onParagraphTap: _partsFor(docLanguage).isEmpty ? null : _onParagraphTap,
                       fontSize: _fontSize,

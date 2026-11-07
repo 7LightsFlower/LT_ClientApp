@@ -122,6 +122,17 @@ class LiveDocument {
   }) {
     final lane = _items.putIfAbsent(language, () => {});
     final previous = lane[key];
+    // KIT re-sends corrected text for a time span it already sent. The newer
+    // message replaces the older ones of the same stream that start inside
+    // its span – otherwise both versions end up mixed into each other.
+    if (kind == 'text' && sender != null && end != null && end > start) {
+      lane.removeWhere((k, it) =>
+          k != key &&
+          it.kind == 'text' &&
+          it.sender == sender &&
+          it.start >= start &&
+          it.start < end);
+    }
     lane[key] = LiveItem(
       start: start,
       kind: kind,
