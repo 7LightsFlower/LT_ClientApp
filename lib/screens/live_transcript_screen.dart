@@ -1030,9 +1030,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       Uint8List? audioBytes;
       String? audioUrl;
       final audioField = (json['b64_enc_pcm_s16le'] as String?)?.trim();
-      // KIT sends no rate for raw TTS PCM; 24 kHz is what its voices use
-      // (same default as the Flask relay).
-      final sampleRate = (json['sample_rate'] as num?)?.toInt() ?? 24000;
+      // KIT sends no rate for raw TTS PCM. Its voices are 16 kHz: at that rate
+      // the pieces have a natural speaking pace (24 kHz played 1.5× too fast).      final sampleRate = (json['sample_rate'] as num?)?.toInt() ?? 16000;
       if (audioField != null && audioField.isNotEmpty && !_looksLikeAudioUrl(audioField)) {
         // Inline audio: base64-encoded 16-bit little-endian PCM.
         try {
