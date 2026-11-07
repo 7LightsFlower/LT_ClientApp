@@ -51,6 +51,9 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   /// server once per sender – see _lookupSenderLanguage.
   final Map<String, Future<String?>> _senderLookups = {};
 
+  /// Last message_id seen per stream (gap detection, like KIT's page).
+  final Map<String, int> _senderIds = {};
+
   /// Set when KIT announces the end of the lecture ("controll": "END").
   bool _sessionEnded = false;
 
@@ -998,7 +1001,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     // is identified by start + end, as on KIT's page ("replace" / "remove").
     final key = markup == 'global_summary'
         ? '$sender|global_summary'
-        : '$sender|$markup|${json['start']}|${json['end']}';
+        : '$sender|$markup|${_timeKey(json['start'])}|${_timeKey(json['end'])}';
     if (action == 'remove') {
       _doc.remove(language, key);
       if (mounted) setState(() {});
@@ -1128,7 +1131,47 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   }
 
   // ========== MAIN MESSAGE HANDLER ==========
-  Future<void> _handleMessage(Map<String, dynamic> json) async {
+  /// A time as a key part. KIT compares times as numbers ("12.50" == 12.5),
+  /// so "replace" / "remove" must find the piece however the time is written.
+  static String _timeKey(Object? v) => _toDouble(v)?.toString() ?? '${v ?? ''}';
+
+  /// KIT's page fetches the messages the stream skipped (corrections and
+  /// removals among them) whenever a stream's message_id jumps. Same here.
+  Future<void> _fetchSkipped(String sender, int from, int to) async {
+    final channel =
+        Uri.tryParse(widget.resolvedUrl)?.queryParameters['channel'] ?? _sseSessionId;
+    if (channel == null || _baseUrl == null || from > to) return;
+    try {
+      final headers = <String, String>{'Content-Type': 'application/json;charset=UTF-8'};
+      if (!kIsWeb && _cookieString != null && _cookieString!.isNotEmpty) {
+        headers['Cookie'] = _cookieString!;
+      }
+      final resp = await _httpClient
+          .post(
+            Uri.parse('$_baseUrl/webapi/$channel/get_previous_messages'),
+            headers: headers,
+            body: jsonEncode(jsonEncode({'component': sender, 'begin': from, 'end': to})),
+          )
+          .timeout(const Duration(seconds: 20));
+      if (resp.statusCode != 200) {
+        debugPrint('❌ Skipped messages of $sender: HTTP ${resp.statusCode}');
+        return;
+      }
+      final list = jsonDecode(utf8.decode(resp.bodyBytes));
+      if (list is! List) return;
+      debugPrint('↩️ $sender: fetched ${list.length} skipped messages ($from–$to)');
+      for (final item in list) {
+        final m = item is String ? jsonDecode(item) : item;
+        if (m is Map<String, dynamic> && m['unstable'] != true) {
+          await _handleMessage(m, skipped: true);
+        }
+      }
+    } catch (e) {
+      debugPrint('❌ Skipped messages of $sender: $e');
+    }
+  }
+
+  Future<void> _handleMessage(Map<String, dynamic> json, {bool skipped = false}) async {
     // Data is flowing, so the connection is healthy: reset the retry budget.
     _reconnectAttempts = 0;
 
@@ -1147,6 +1190,18 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     // KIT announces the end of the lecture per stream; the ASR one counts.
     if ((json['controll'] ?? json['control']) == 'END' && sender.startsWith('asr')) {
       _sessionEnded = true;
+    }
+
+    // A gap in a text stream's message ids: fetch what was skipped first.
+    final messageId = _toInt(json['message_id']);
+    if (!skipped && messageId != null && sender.isNotEmpty && !RegExp(r'^(tts|lip)').hasMatch(sender)) {
+      final last = _senderIds[sender];
+      if (last == null || messageId > last + 1) {
+        _senderIds[sender] = messageId;
+        await _fetchSkipped(sender, (last ?? -1) + 1, messageId - 1);
+      } else if (messageId > last) {
+        _senderIds[sender] = messageId;
+      }
     }
 
     // Headings, paragraph breaks, summaries, notes → the document view.
@@ -1338,7 +1393,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     if (isUnstable) {
       key = unstableKey;
     } else if (start.isNotEmpty) {
-      key = '$sender|$start|${json['end']}';
+      key = '$sender|${_timeKey(json['start'])}|${_timeKey(json['end'])}';
     } else {
       final textPrefix = transcriptText.length > 20 ? transcriptText.substring(0, 20) : transcriptText;
       key = '$sender|$textPrefix';
