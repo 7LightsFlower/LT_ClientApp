@@ -1143,16 +1143,43 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       // The language's player: keep the part, continue if it was waiting.
       if (audioBytes != null) {
         final parts = _ttsParts.putIfAbsent(language, () => []);
-        parts.add(TtsPart(
-          key: '$sender|${json['message_id']}|${json['min_message_id']}',
+        final textSender = sender.replaceFirst('tts', 'mt'); // tts:N speaks mt:N
+        final maxId = _toInt(json['max_message_id']);
+        var minId = _toInt(json['min_message_id']);
+        // KIT names only the LAST text message of a piece (min = max), but a
+        // piece speaks everything since the previous piece: start right after
+        // the previous piece's last message, so every sentence gets highlighted.
+        if (maxId != null) {
+          int? prevMax;
+          for (final p in parts) {
+            final m = p.maxId;
+            if (p.textSender == textSender && m != null && m < maxId && (prevMax == null || m > prevMax)) {
+              prevMax = m;
+            }
+          }
+          if (prevMax != null && prevMax + 1 <= maxId) minId = prevMax + 1;
+        }
+        final part = TtsPart(
+          key: '$sender|${json['message_id']}|$maxId',
           audio: audioBytes,
-          textSender: sender.replaceFirst('tts', 'mt'), // tts:N speaks mt:N
+          textSender: textSender,
           text: transcriptText,
-          minId: _toInt(json['min_message_id']),
-          maxId: _toInt(json['max_message_id']),
-        ));
+          minId: minId,
+          maxId: maxId,
+        );
+        // Downloads can finish out of order: keep the pieces in text order.
+        var at = parts.length;
+        if (maxId != null) {
+          while (at > 0 && (parts[at - 1].maxId ?? -1) > maxId) {
+            at--;
+          }
+        }
+        parts.insert(at, part);
+        if (_ttsLanguage == language && _ttsIndex != null && at <= _ttsIndex!) {
+          _ttsIndex = _ttsIndex! + 1; // the piece playing moved one place down
+        }
         if (_ttsWaiting && _ttsLanguage == language) {
-          _playTtsAt(language, parts.length - 1);
+          _ttsNext(auto: true); // continue with the next piece in order
         }
       }
 
@@ -1503,7 +1530,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                           ? const DocContent([], [])
                           : _doc.build(docLanguage),
                       controller: _scrollController,
-                      isSpoken: spokenPart?.speaks,
+                      isSpoken: spokenPart == null ? null : spokenPart.speaks,
                       spokenToken: spokenPart?.key,
                       onParagraphTap: _partsFor(docLanguage).isEmpty ? null : _onParagraphTap,
                       fontSize: _fontSize,
