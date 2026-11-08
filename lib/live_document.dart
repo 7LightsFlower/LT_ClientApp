@@ -118,6 +118,9 @@ class LiveDocument {
 
   void clear() {
     _items.clear();
+    _shown.clear();
+    _shownRank.clear();
+    _spokenStream.clear();
     revision++;
     _order = 0;
     _firstStart = null;
@@ -168,13 +171,48 @@ class LiveDocument {
     if (_items[language]?.remove(key) != null) revision++;
   }
 
-  /// Removes all text of one stream from [language].
-  void removeSender(String language, String sender) {
-    final lane = _items[language];
-    if (lane == null) return;
-    final before = lane.length;
-    lane.removeWhere((_, it) => it.kind == 'text' && it.sender == sender);
-    if (lane.length != before) revision++;
+  // ── Which stream's text is shown per language ──
+  //
+  // The server can map more than one stream to the same language; showing all
+  // of them would print every sentence twice. All are kept, one is shown:
+  // the stream the spoken audio reads (so highlighting finds its text),
+  // otherwise the best-ranked stream that arrived first.
+
+  final Map<String, String> _shown = {};
+  final Map<String, int> _shownRank = {};
+  final Map<String, String> _spokenStream = {};
+
+  /// The stream whose text [build] shows for [language].
+  String? shownSender(String language) => _shown[language];
+
+  /// A text stream for [language] sent something.
+  void offerSender(String language, String sender, int rank) {
+    final spoken = _spokenStream[language];
+    if (spoken != null && _shown[language] == spoken) return;
+    if (sender == spoken) {
+      _show(language, sender, 1 << 20);
+      return;
+    }
+    final current = _shown[language];
+    if (current == null || (current != sender && rank > (_shownRank[language] ?? 0))) {
+      _show(language, sender, rank);
+    }
+  }
+
+  /// The spoken audio of [language] reads [sender]'s text: show that one.
+  void preferSender(String language, String sender) {
+    if (_spokenStream[language] == sender) return;
+    _spokenStream[language] = sender;
+    final has = _items[language]?.values.any((it) => it.kind == 'text' && it.sender == sender) ?? false;
+    if (has) _show(language, sender, 1 << 20);
+  }
+
+  void _show(String language, String sender, int rank) {
+    if (_shown[language] != sender) {
+      _shown[language] = sender;
+      revision++;
+    }
+    _shownRank[language] = rank;
   }
 
   /// Length of the talk so far, or null if unknown.
@@ -191,7 +229,10 @@ class LiveDocument {
     if (lane == null || lane.isEmpty) return const DocContent([], []);
 
     final keyOf = <LiveItem, String>{for (final e in lane.entries) e.value: e.key};
-    final items = lane.values.toList()
+    final shown = _shown[language];
+    final items = lane.values
+        .where((it) => it.kind != 'text' || shown == null || it.sender == null || it.sender == shown)
+        .toList()
       ..sort((a, b) {
         // Like KIT's page: text still being recognised is always the tail.
         if (a.unstable != b.unstable) return a.unstable ? 1 : -1;

@@ -51,9 +51,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   /// server once per sender – see _lookupSenderLanguage.
   final Map<String, Future<String?>> _senderLookups = {};
 
-  /// The one stream whose text is shown for each language.
-  final Map<String, String> _textSenderOf = {};
-
   /// Which stream should provide a language's text: the translation
   /// ("mt:6") or recognition ("asr:…") streams, before any other stream the
   /// server maps to the same language.
@@ -450,7 +447,6 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _isConnecting = true;
       _messagesMap.clear();
       _doc.clear();
-      _textSenderOf.clear();
       _senderIds.clear();
       _ttsParts.clear();
       _selectedLanguage = null;
@@ -1287,6 +1283,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       if (audioBytes != null) {
         final parts = _ttsParts.putIfAbsent(language, () => []);
         final textSender = sender.replaceFirst('tts', 'mt'); // tts:N speaks mt:N
+        _doc.preferSender(language.replaceFirst(RegExp(r'\s*Audio$'), ''), textSender); // show the text it reads
         final maxId = _toInt(json['max_message_id']);
         var minId = _toInt(json['min_message_id']);
         // KIT names only the LAST text message of a piece (min = max), but a
@@ -1401,20 +1398,9 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     final language = await _languageFor(sender);
     _registerLanguage(language);
 
-    // Two streams in one language would show every sentence twice: keep one.
-    final owner = _textSenderOf[language];
-    if (owner != sender) {
-      if (owner == null || _senderRank(sender) > _senderRank(owner)) {
-        if (owner != null) {
-          debugPrint('🔀 $language: text from $sender instead of $owner');
-          _doc.removeSender(language, owner);
-        }
-        _textSenderOf[language] = sender;
-      } else {
-        debugPrint('🚫 $sender ignored: $language already comes from $owner');
-        return;
-      }
-    }
+    // Two streams in one language would show every sentence twice: all are
+    // kept, the document shows one (see LiveDocument.offerSender).
+    _doc.offerSender(language, sender, _senderRank(sender));
     debugPrint('📝 $sender id=${json['message_id']} start=${json['start']} end=${json['end']} '
         '$action${isUnstable ? ' UNSTABLE' : ''}: $transcriptText');
 
