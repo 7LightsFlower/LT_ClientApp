@@ -51,6 +51,18 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   /// server once per sender – see _lookupSenderLanguage.
   final Map<String, Future<String?>> _senderLookups = {};
 
+  /// The one stream whose text is shown for each language.
+  final Map<String, String> _textSenderOf = {};
+
+  /// Which stream should provide a language's text: the translation
+  /// ("mt:6") or recognition ("asr:…") streams, before any other stream the
+  /// server maps to the same language.
+  static int _senderRank(String sender) {
+    if (RegExp(r'^mt:\d+$').hasMatch(sender)) return 3;
+    if (sender.startsWith('asr')) return 2;
+    return 1;
+  }
+
   /// Last message_id seen per stream (gap detection, like KIT's page).
   final Map<String, int> _senderIds = {};
 
@@ -438,6 +450,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _isConnecting = true;
       _messagesMap.clear();
       _doc.clear();
+      _textSenderOf.clear();
+      _senderIds.clear();
       _ttsParts.clear();
       _selectedLanguage = null;
       _playingKey = null;
@@ -1368,6 +1382,9 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     // ============================================================
     // NON-TTS MESSAGE
     // ============================================================
+    // Sentence regrouping for speakers / summaries – KIT's page never shows it.
+    if (json.containsKey('refined_sentence_cluster')) return;
+
     String transcriptText = (json['text'] ?? json['seq'] ?? '').toString().trim();
     transcriptText = _cleanTranscript(transcriptText);
     // Same rules as KIT's own page:
@@ -1383,6 +1400,21 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
     final language = await _languageFor(sender);
     _registerLanguage(language);
+
+    // Two streams in one language would show every sentence twice: keep one.
+    final owner = _textSenderOf[language];
+    if (owner != sender) {
+      if (owner == null || _senderRank(sender) > _senderRank(owner)) {
+        if (owner != null) {
+          debugPrint('🔀 $language: text from $sender instead of $owner');
+          _doc.removeSender(language, owner);
+        }
+        _textSenderOf[language] = sender;
+      } else {
+        debugPrint('🚫 $sender ignored: $language already comes from $owner');
+        return;
+      }
+    }
     debugPrint('📝 $sender id=${json['message_id']} start=${json['start']} end=${json['end']} '
         '$action${isUnstable ? ' UNSTABLE' : ''}: $transcriptText');
 

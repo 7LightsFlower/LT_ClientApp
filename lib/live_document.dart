@@ -168,6 +168,15 @@ class LiveDocument {
     if (_items[language]?.remove(key) != null) revision++;
   }
 
+  /// Removes all text of one stream from [language].
+  void removeSender(String language, String sender) {
+    final lane = _items[language];
+    if (lane == null) return;
+    final before = lane.length;
+    lane.removeWhere((_, it) => it.kind == 'text' && it.sender == sender);
+    if (lane.length != before) revision++;
+  }
+
   /// Length of the talk so far, or null if unknown.
   Duration? get duration {
     if (_firstStart == null || _lastEnd == null) return null;
