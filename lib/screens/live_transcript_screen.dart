@@ -777,14 +777,77 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     return parts[i];
   }
 
+  /// Sample rate of the session's spoken pieces (KIT: 16 kHz).
+  int _ttsSampleRate = 16000;
+
+  /// Downloads running per piece, so a piece is fetched only once.
+  final Map<String, Future<Uint8List?>> _ttsLoads = {};
+
+  /// Counts play requests: a slow download must not start an older request.
+  int _ttsPlayRequest = 0;
+
+  /// The audio of a piece, downloaded on first use.
+  Future<Uint8List?> _loadTtsAudio(TtsPart part) {
+    final ready = part.audio;
+    if (ready != null) return Future.value(ready);
+    final url = part.audioUrl;
+    if (url == null || part.failed) return Future.value(null);
+    return _ttsLoads.putIfAbsent(part.key, () async {
+      try {
+        final headers = _browserHeaders();
+        if (!kIsWeb) headers['Referer'] = widget.originalUrl ?? _baseUrl!;
+        final response =
+            await _httpClient.get(Uri.parse(url), headers: headers).timeout(const Duration(seconds: 15));
+        if (response.statusCode != 200) {
+          debugPrint('❌ Audio $url: HTTP ${response.statusCode}');
+          part.failed = true;
+          return null;
+        }
+        final audio = _decodeAudioResponse(response);
+        final wav = _pcmToWav(audio.pcm, sampleRate: audio.sampleRate ?? _ttsSampleRate);
+        part.audio = wav;
+        if (mounted) setState(() {}); // the real length replaces the estimate
+        return wav;
+      } catch (e) {
+        debugPrint('❌ Audio $url: $e');
+        part.failed = true;
+        return null;
+      } finally {
+        _ttsLoads.remove(part.key);
+      }
+    });
+  }
+
   Future<void> _playTtsAt(String language, int index, {Duration offset = Duration.zero}) async {
     final parts = _partsFor(language);
     if (index < 0 || index >= parts.length) return;
+    final request = ++_ttsPlayRequest;
     try {
       await _audioPlayer.stop(); // the per-segment player of the list view
+      final part = parts[index];
+      if (part.audio == null && mounted) {
+        // Show where we are while the piece downloads.
+        setState(() {
+          _ttsLanguage = language;
+          _ttsIndex = index;
+          _ttsPlaying = true;
+          _ttsWaiting = false;
+          _ttsPartFinished = false;
+          _ttsPosition = Duration.zero;
+        });
+      }
+      final wav = await _loadTtsAudio(part);
+      if (request != _ttsPlayRequest || !mounted) return; // something else was asked for meanwhile
+      if (wav == null) {
+        // Could not be loaded: go on with the next piece.
+        _ttsIndex = parts.indexOf(part);
+        _ttsNext(auto: true);
+        return;
+      }
       await _ttsPlayer.stop();
-      await _setWavSource(_ttsPlayer, parts[index].audio, parts[index].key);
-      if (!mounted) return;
+      await _setWavSource(_ttsPlayer, wav, part.key);
+      if (!mounted || request != _ttsPlayRequest) return;
+      index = parts.indexOf(part); // pieces may have been inserted meanwhile
       setState(() {
         _ttsLanguage = language;
         _ttsIndex = index;
@@ -798,6 +861,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         await _ttsPlayer.seek(offset);
         if (mounted) setState(() => _ttsPosition = offset);
       }
+      // Fetch the next piece while this one plays: no gap in between.
+      if (index + 1 < parts.length) _loadTtsAudio(parts[index + 1]);
     } catch (e) {
       debugPrint('❌ TTS playback: $e');
       if (!mounted) return;
@@ -825,6 +890,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   /// Play / pause. The first play starts with the newest part (live).
   Future<void> _ttsPlayPause(String language) async {
     if (_ttsPlaying) {
+      _ttsPlayRequest++; // also cancels a piece that is still downloading
       await _ttsPlayer.pause();
       if (mounted) setState(() => _ttsPlaying = false);
       return;
@@ -848,6 +914,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
   }
 
   void _stopTts() {
+    _ttsPlayRequest++; // a download still running must not start playing
     _ttsPlayer.stop();
     _ttsLanguage = null;
     _ttsIndex = null;
@@ -867,6 +934,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     final lang = _documentLanguage();
     if (lang == null || _isOriginal(lang)) return;
     if (_audioOn) {
+      _ttsPlayRequest++; // also cancels a piece that is still downloading
       await _ttsPlayer.pause();
       if (mounted) {
         setState(() {
@@ -922,11 +990,24 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     var i = parts.indexWhere((p) => paragraph.spans.any(p.speaksId));
     if (i < 0) {
       // Not found by id: by text.
-      final content = _doc.build(lang);
+      final content = _docFor(lang);
       final keys = {for (final s in paragraph.spans) s.key};
       i = parts.indexWhere((p) => spokenSpanKeys(content, p).any(keys.contains));
     }
     if (i >= 0) _playTtsAt(lang, i);
+  }
+
+  /// The document of a language, built again only when something changed
+  /// (long sessions: building on every player tick would be slow).
+  String? _docCacheId;
+  DocContent _docCache = const DocContent([], []);
+  DocContent _docFor(String language) {
+    final id = '$language#${_doc.revision}';
+    if (id != _docCacheId) {
+      _docCacheId = id;
+      _docCache = _doc.build(language);
+    }
+    return _docCache;
   }
 
   /// Segments the playing piece says (cached per piece and document change).
@@ -1237,19 +1318,20 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       final String language = await _languageFor(sender);
       _registerLanguage(language);
 
-      // Audio fetching
+      // Audio: inline audio is decoded right away; linked audio is only
+      // downloaded when it is about to be played (long sessions replay every
+      // piece – downloading them all would take minutes).
       Uint8List? audioBytes;
       String? audioUrl;
       final audioField = (json['b64_enc_pcm_s16le'] as String?)?.trim();
       // KIT sends no rate for raw TTS PCM. Its voices are 16 kHz: at that rate
       // the pieces have a natural speaking pace (24 kHz played 1.5× too fast).
       final sampleRate = (json['sample_rate'] as num?)?.toInt() ?? 16000;
+      _ttsSampleRate = sampleRate;
       if (audioField != null && audioField.isNotEmpty && !_looksLikeAudioUrl(audioField)) {
         // Inline audio: base64-encoded 16-bit little-endian PCM.
         try {
-          final pcm = base64Decode(audioField);
-          audioBytes = _pcmToWav(pcm, sampleRate: sampleRate);
-          debugPrint('✅ Decoded inline audio: ${audioBytes.length} bytes');
+          audioBytes = _pcmToWav(base64Decode(audioField), sampleRate: sampleRate);
         } catch (e) {
           debugPrint('❌ Could not decode inline audio: $e');
         }
@@ -1257,30 +1339,11 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         // The message links audio under /ltapi/ (internal, needs a login).
         // KIT's public page fetches the same data under /webapi/ – no login.
         final path = audioField.replaceFirst('/ltapi/', '/webapi/');
-        final fullUrl = path.startsWith('http') ? path : '$_baseUrl$path';
-        debugPrint('🎵 Audio URL: $fullUrl');
-        try {
-          final headers = _browserHeaders();
-          if (!kIsWeb) headers['Referer'] = widget.originalUrl ?? _baseUrl!;
-          final response = await _httpClient
-              .get(Uri.parse(fullUrl), headers: headers)
-              .timeout(const Duration(seconds: 15));
-          if (response.statusCode == 200) {
-            final audio = _decodeAudioResponse(response);
-            audioBytes = _pcmToWav(audio.pcm, sampleRate: audio.sampleRate ?? sampleRate);
-            debugPrint('✅ Audio ready: ${audioBytes.length} bytes');
-          } else {
-            audioUrl = fullUrl; // fallback: web opens the link in a tab
-            debugPrint('❌ Failed to fetch audio: HTTP ${response.statusCode}');
-          }
-        } catch (e) {
-          audioUrl = fullUrl;
-          debugPrint('❌ Error loading audio: $e');
-        }
+        audioUrl = path.startsWith('http') ? path : '$_baseUrl$path';
       }
 
       // The language's player: keep the part, continue if it was waiting.
-      if (audioBytes != null) {
+      if (audioBytes != null || audioUrl != null) {
         final parts = _ttsParts.putIfAbsent(language, () => []);
         final textSender = sender.replaceFirst('tts', 'mt'); // tts:N speaks mt:N
         _doc.preferSender(language.replaceFirst(RegExp(r'\s*Audio$'), ''), textSender); // show the text it reads
@@ -1304,6 +1367,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         final part = TtsPart(
           key: '$sender|${json['message_id']}|$maxId',
           audio: audioBytes,
+          audioUrl: audioUrl,
           textSender: textSender,
           text: transcriptText,
           minId: minId,
@@ -1342,7 +1406,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
             language: msg.language,
             isUnstable: msg.isUnstable,
             // Don't wipe audio we already have if this download failed.
-            audioData: audioBytes ?? msg.audioData,
+            audioData: msg.audioData,
             audioUrl: audioUrl ?? msg.audioUrl,
           );
           _messagesMap[key] = updatedMsg;
@@ -1361,7 +1425,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
           timestamp: DateTime.now(),
           language: language,
           isUnstable: false,
-          audioData: audioBytes,
+          audioData: null,
           audioUrl: audioUrl,
         );
         debugPrint('🆕 Created new TTS message with language: $language');
@@ -1467,6 +1531,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     }
 
     if (_ttsPlaying) {
+      _ttsPlayRequest++; // also cancels a piece that is still downloading
       await _ttsPlayer.pause();
       if (mounted) setState(() => _ttsPlaying = false);
     }
@@ -1629,7 +1694,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     final docLanguage = _documentView ? _documentLanguage() : null;
     final spokenPart = (_documentView && _ttsLanguage == docLanguage) ? _currentTtsPart : null;
     final docParts = _partsFor(docLanguage);
-    final docContent = docLanguage == null ? const DocContent([], []) : _doc.build(docLanguage);
+    final docContent = docLanguage == null ? const DocContent([], []) : _docFor(docLanguage);
     final spokenKeys = spokenPart == null ? null : _spokenKeys(docContent, spokenPart);
 
     return PopScope(

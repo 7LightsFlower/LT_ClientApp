@@ -48,6 +48,10 @@ class LiveDocumentView extends StatefulWidget {
 class _LiveDocumentViewState extends State<LiveDocumentView> {
   final GlobalKey _spokenKey = GlobalKey();
 
+  /// Chapters opened / closed by the reader (by position).
+  final Set<int> _opened = {};
+  final Set<int> _closed = {};
+
   @override
   void didUpdateWidget(LiveDocumentView old) {
     super.didUpdateWidget(old);
@@ -106,15 +110,15 @@ class _LiveDocumentViewState extends State<LiveDocumentView> {
       ));
     }
 
-    for (final b in content.blocks) {
+    Widget blockWidget(DocBlock b) {
       switch (b.kind) {
         case 'heading':
-          children.add(Padding(
+          return (Padding(
             padding: const EdgeInsets.only(top: 14, bottom: 6),
             child: Text(b.text, style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold)),
           ));
         case 'speaker':
-          children.add(Padding(
+          return (Padding(
             padding: const EdgeInsets.only(top: 10, bottom: 2),
             child: Text(b.text,
                 style: theme.textTheme.labelMedium?.copyWith(color: blue, fontWeight: FontWeight.bold)),
@@ -154,14 +158,14 @@ class _LiveDocumentViewState extends State<LiveDocumentView> {
             para = KeyedSubtree(key: _spokenKey, child: para);
             spokenKeyUsed = true;
           }
-          children.add(para);
+          return para;
         default: // summary / notes / postedited
           final label = switch (b.kind) {
             'notes' => 'Notes',
             'postedited' => 'Post-edited',
             _ => 'Summary',
           };
-          children.add(Container(
+          return (Container(
             margin: const EdgeInsets.only(left: 12, bottom: 12),
             padding: const EdgeInsets.fromLTRB(10, 6, 8, 6),
             decoration: BoxDecoration(
@@ -178,6 +182,64 @@ class _LiveDocumentViewState extends State<LiveDocumentView> {
       }
     }
 
+    // Chapters, like KIT's page: for long sessions only the chapter titles
+    // and the newest chapter are open. Tap a title to open or close it; the
+    // chapter being read aloud opens by itself.
+    final sections = <({DocBlock? heading, List<DocBlock> body})>[];
+    for (final b in content.blocks) {
+      if (b.kind == 'heading') {
+        sections.add((heading: b, body: <DocBlock>[]));
+      } else {
+        if (sections.isEmpty) sections.add((heading: null, body: <DocBlock>[]));
+        sections.last.body.add(b);
+      }
+    }
+    final hasChapters = sections.any((x) => x.heading != null);
+    final isSpoken = widget.isSpoken;
+    for (var i = 0; i < sections.length; i++) {
+      final sec = sections[i];
+      if (!hasChapters) {
+        children.addAll(sec.body.map(blockWidget));
+        continue;
+      }
+      final speaking = isSpoken != null &&
+          sec.body.any((b) => b.kind == 'para' && b.spans.any(isSpoken));
+      final open = !_closed.contains(i) && (_opened.contains(i) || i == sections.length - 1 || speaking);
+      final number = sections.first.heading == null ? i : i + 1;
+      final title = sec.heading?.text ?? 'Beginning';
+      children.add(InkWell(
+        onTap: () => setState(() {
+          if (open) {
+            _opened.remove(i);
+            _closed.add(i);
+          } else {
+            _closed.remove(i);
+            _opened.add(i);
+          }
+        }),
+        child: Padding(
+          padding: const EdgeInsets.only(top: 12, bottom: 6),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (sec.heading != null)
+                SizedBox(
+                  width: 34,
+                  child: Text('$number',
+                      style: theme.textTheme.titleLarge?.copyWith(color: theme.colorScheme.primary)),
+                ),
+              Expanded(
+                child: Text(title,
+                    style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold)),
+              ),
+              Icon(open ? Icons.expand_less : Icons.expand_more),
+            ],
+          ),
+        ),
+      ));
+      if (open) children.addAll(sec.body.map(blockWidget));
+    }
+
     return SelectionArea(
       child: ListView(
         controller: widget.controller,
@@ -192,20 +254,32 @@ class _LiveDocumentViewState extends State<LiveDocumentView> {
 class TtsPart {
   TtsPart({
     required this.key,
-    required this.audio,
+    this.audio,
+    this.audioUrl,
     required this.textSender,
     required this.text,
     this.minId,
     this.maxId,
-  }) : duration = wavDuration(audio);
+  });
 
   final String key;
 
-  /// WAV bytes.
-  final Uint8List audio;
+  /// WAV bytes – null until downloaded (long sessions: only what is played).
+  Uint8List? audio;
 
-  /// Length of [audio].
-  final Duration duration;
+  /// Where to download the audio from (when it did not come inline).
+  final String? audioUrl;
+
+  /// The download failed – skip this piece.
+  bool failed = false;
+
+  /// Length of the audio; estimated from the text until it is downloaded.
+  Duration get duration {
+    final a = audio;
+    if (a != null) return wavDuration(a);
+    // About 14 characters per second of speech.
+    return Duration(milliseconds: (text.length * 1000 / 14).round().clamp(500, 60000));
+  }
 
   /// The text stream it speaks ("mt:1" for "tts:1").
   final String textSender;
