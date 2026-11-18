@@ -34,6 +34,24 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
 
   bool _isProcessing = false;
 
+  /// Codes that were just rejected, with when: the camera sees the same
+  /// wrong code many times a second – it gets its message only once.
+  final Map<String, DateTime> _rejected = {};
+  static const _ignoreRejectedFor = Duration(seconds: 5);
+
+  void _showScanMessage(String text) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(text),
+          backgroundColor: Colors.grey.shade800,
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 2),
+        ),
+      );
+  }
+
   @override
   void dispose() {
     scannerController?.dispose();
@@ -135,18 +153,8 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
       if (mounted) {
         Navigator.pop(context); // close loading dialog
         final ended = e.toString().contains('already ended');
-        ScaffoldMessenger.of(context)
-          ..hideCurrentSnackBar()
-          ..showSnackBar(
-            SnackBar(
-              content: Text(ended
-                  ? 'This session has already ended'
-                  : 'Invalid link in the QR code'),
-              backgroundColor: Colors.grey.shade800,
-              behavior: SnackBarBehavior.floating,
-              duration: const Duration(seconds: 2),
-            ),
-          );
+        _rejected[rawInput.trim()] = DateTime.now();
+        _showScanMessage(ended ? 'This session has already ended' : 'Invalid link in the QR code');
         setState(() => _isProcessing = false);
       }
       return;
@@ -230,8 +238,41 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
 
     // The outer Scaffold in build() owns the FAB; a nested Scaffold with its
     // own FAB caused two overlapping buttons and a duplicate Hero tag.
+    // Only codes inside the square are read: point the square at the code.
+    return LayoutBuilder(builder: (context, constraints) {
+      final size = constraints.biggest;
+      final side = (size.shortestSide * 0.7).clamp(160.0, 320.0);
+      final window = Rect.fromCenter(
+        center: Offset(size.width / 2, size.height / 2 - 40), // a bit above the button
+        width: side,
+        height: side,
+      );
+      return Stack(
+        fit: StackFit.expand,
+        children: [
+          _buildCamera(controller, window),
+          IgnorePointer(child: CustomPaint(painter: _ScanSquarePainter(window))),
+          Positioned(
+            left: 24,
+            right: 24,
+            top: window.bottom + 16,
+            child: const IgnorePointer(
+              child: Text(
+                'Hold the QR code inside the square',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w500),
+              ),
+            ),
+          ),
+        ],
+      );
+    });
+  }
+
+  Widget _buildCamera(MobileScannerController controller, Rect window) {
     return MobileScanner(
         controller: controller,
+        scanWindow: window,
         onDetect: _onScanComplete,
         errorBuilder: (context, error) {
           // No camera / no permission: show a calm hint. The floating
@@ -267,10 +308,23 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
   }
 
   Future<void> _onScanComplete(BarcodeCapture capture) async {
-    if (_isProcessing) return;
-    final String? rawValue = capture.barcodes.first.rawValue;
-    if (rawValue == null) return;
-    await _proceedWithUrl(rawValue);
+    if (_isProcessing || capture.barcodes.isEmpty) return;
+    final value = capture.barcodes.first.rawValue?.trim();
+    if (value == null || value.isEmpty) return;
+
+    // The same wrong code again (still in front of the camera): stay quiet.
+    final now = DateTime.now();
+    _rejected.removeWhere((_, at) => now.difference(at) > _ignoreRejectedFor);
+    if (_rejected.containsKey(value)) return;
+
+    // Not a link at all: no need to ask the server.
+    final isLink = RegExp(r'^(https?|wss?)://', caseSensitive: false).hasMatch(value);
+    if (!isLink) {
+      _rejected[value] = now;
+      _showScanMessage('Invalid link in the QR code');
+      return;
+    }
+    await _proceedWithUrl(value);
   }
 
   void _showManualEntryDialog() {
@@ -330,4 +384,52 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
           : null,
     );
   }
+}
+
+/// Darkens everything outside the scan square and draws its corners.
+class _ScanSquarePainter extends CustomPainter {
+  _ScanSquarePainter(this.window);
+  final Rect window;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final hole = RRect.fromRectAndRadius(window, const Radius.circular(16));
+    final shade = Path()
+      ..fillType = PathFillType.evenOdd
+      ..addRect(Offset.zero & size)
+      ..addRRect(hole);
+    canvas.drawPath(shade, Paint()..color = Colors.black.withValues(alpha: 0.55));
+
+    // Corner marks.
+    final paint = Paint()
+      ..color = Colors.white
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 5
+      ..strokeCap = StrokeCap.round;
+    const len = 32.0, r = 16.0;
+    final l = window.left, t = window.top, rt = window.right, b = window.bottom;
+    canvas.drawPath(
+      Path()
+        ..moveTo(l, t + len)
+        ..lineTo(l, t + r)
+        ..arcToPoint(Offset(l + r, t), radius: const Radius.circular(r))
+        ..lineTo(l + len, t)
+        ..moveTo(rt - len, t)
+        ..lineTo(rt - r, t)
+        ..arcToPoint(Offset(rt, t + r), radius: const Radius.circular(r))
+        ..lineTo(rt, t + len)
+        ..moveTo(rt, b - len)
+        ..lineTo(rt, b - r)
+        ..arcToPoint(Offset(rt - r, b), radius: const Radius.circular(r))
+        ..lineTo(rt - len, b)
+        ..moveTo(l + len, b)
+        ..lineTo(l + r, b)
+        ..arcToPoint(Offset(l, b - r), radius: const Radius.circular(r))
+        ..lineTo(l, b - len),
+      paint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_ScanSquarePainter old) => old.window != window;
 }
