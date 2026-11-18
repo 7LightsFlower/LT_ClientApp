@@ -13,6 +13,7 @@ import 'package:path_provider/path_provider.dart';
 import '../models/transcript_message.dart';
 import '../cookie_utils.dart';
 import '../language_names.dart';
+import '../audio_state.dart';
 import '../live_document.dart';
 import '../live_export.dart';
 import '../widgets/live_document_view.dart';
@@ -59,6 +60,14 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     if (sender.startsWith('asr')) return 2;
     return 1;
   }
+
+  /// Mic state of the speaker (muted / silence / music / no audio yet).
+  final AudioState _audioState = AudioState();
+  Timer? _bannerTimer;
+  AudioBannerKind? _lastBannerKind;
+
+  /// Streams whose whole history is being loaded right now.
+  final Set<String> _historyLoading = {};
 
   /// Last message_id seen per stream (gap detection, like KIT's page).
   final Map<String, int> _senderIds = {};
@@ -240,6 +249,15 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
     _initSession();
     _setupAudioListeners();
+    // The banner's running time ("Silence 1:23") ticks every second.
+    _bannerTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      final kind = _audioState.banner?.kind;
+      if (kind == null && _lastBannerKind == null) return;
+      final appeared = kind != null && _lastBannerKind == null;
+      setState(() => _lastBannerKind = kind);
+      if (appeared) _scrollToBottom();
+    });
     _loadSessionTitle();
     _ttsCompleteSub = _ttsPlayer.onPlayerComplete.listen((_) {
       _ttsPartFinished = true;
@@ -447,6 +465,8 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       _isConnecting = true;
       _messagesMap.clear();
       _doc.clear();
+      _audioState.reset();
+      _historyLoading.clear();
       _senderIds.clear();
       _ttsParts.clear();
       _selectedLanguage = null;
@@ -557,6 +577,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
         _isConnected = true;
         _isConnecting = false;
       });
+      _loadAsrHistory();
     }).catchError((error) {
       debugPrint('❌ Failed to connect SSE: $error');
       if (!mounted) return;
@@ -997,6 +1018,56 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     if (i >= 0) _playTtsAt(lang, i);
   }
 
+  /// "Muted 3:12" / "Silence 0:45" / "♪ Music 1:02" / "No audio yet 0:10"
+  /// after the last output, like KIT's page.
+  Widget? _buildAudioBanner(String? language) {
+    final b = _audioState.banner;
+    if (b == null) return null;
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final (Color bg, Color fg, IconData icon) = switch (b.kind) {
+      AudioBannerKind.muted => dark
+          ? (const Color(0x33EF5350), const Color(0xFFFF8A80), Icons.mic_off)
+          : (const Color(0xFFFEE2E2), const Color(0xFFB91C1C), Icons.mic_off),
+      AudioBannerKind.silence => dark
+          ? (const Color(0x33EF5350), const Color(0xFFFF8A80), Icons.hourglass_bottom)
+          : (const Color(0xFFFEE2E2), const Color(0xFFB91C1C), Icons.hourglass_bottom),
+      AudioBannerKind.music => dark
+          ? (const Color(0x337E57C2), const Color(0xFFD1C4E9), Icons.music_note)
+          : (const Color(0xFFEDE7F6), const Color(0xFF5B2C83), Icons.music_note),
+      AudioBannerKind.noAudio => dark
+          ? (const Color(0x33B0BEC5), const Color(0xFFCFD8DC), Icons.mic_off)
+          : (const Color(0xFFF1F5F9), const Color(0xFF475569), Icons.mic_off),
+    };
+    final label = bannerLabel(b.kind, language);
+    final time = formatBannerTime(DateTime.now().difference(b.since));
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.only(top: 10, bottom: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+        decoration: BoxDecoration(
+          color: bg,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: fg.withValues(alpha: 0.25)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 16, color: fg),
+            const SizedBox(width: 8),
+            Text('$label  $time',
+                style: TextStyle(
+                  color: fg,
+                  fontWeight: FontWeight.w600,
+                  fontSize: 14,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                )),
+          ],
+        ),
+      ),
+    );
+  }
+
   /// The document of a language, built again only when something changed
   /// (long sessions: building on every player tick would be slow).
   String? _docCacheId;
@@ -1253,12 +1324,59 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       debugPrint('↩️ $sender: fetched ${list.length} skipped messages ($from–$to)');
       for (final item in list) {
         final m = item is String ? jsonDecode(item) : item;
-        if (m is Map<String, dynamic> && m['unstable'] != true) {
-          await _handleMessage(m, skipped: true);
+        if (m is Map<String, dynamic>) {
+          final id = _toInt(m['message_id']);
+          if (id != null && id > (_senderIds[sender] ?? -1)) _senderIds[sender] = id;
+          if (m['unstable'] != true) await _handleMessage(m, skipped: true);
         }
       }
     } catch (e) {
       debugPrint('❌ Skipped messages of $sender: $e');
+    }
+  }
+
+  /// Joining while the mic is muted or nobody speaks: the stream sends
+  /// nothing then, so read the ASR's history (like KIT's page does on load).
+  /// It holds the START / PAUSE / START_AUDIO / speech & music signals the
+  /// banner is built from – and the transcript so far.
+  Future<void> _loadAsrHistory() async {
+    final channel =
+        Uri.tryParse(widget.resolvedUrl)?.queryParameters['channel'] ?? _sseSessionId;
+    if (channel == null || _baseUrl == null) return;
+    final asr = <String>{};
+    try {
+      final resp = await _httpClient
+          .post(Uri.parse('$_baseUrl/webapi/$channel/getgraph'),
+              headers: {'Content-Type': 'application/json;charset=UTF-8'})
+          .timeout(const Duration(seconds: 15));
+      if (resp.statusCode == 200) {
+        void collect(Object? v) {
+          if (v is String) {
+            if (RegExp(r'^asr(:|$)').hasMatch(v)) asr.add(v);
+          } else if (v is Map) {
+            v.forEach((k, x) {
+              collect(k);
+              collect(x);
+            });
+          } else if (v is List) {
+            v.forEach(collect);
+          }
+        }
+        collect(jsonDecode(utf8.decode(resp.bodyBytes)));
+      }
+    } catch (e) {
+      debugPrint('❌ getgraph: $e');
+    }
+    if (asr.isEmpty) asr.add('asr:0');
+    debugPrint('🎙️ ASR streams for the mic state: $asr');
+    for (final s in asr) {
+      if (_senderIds.containsKey(s) || _historyLoading.contains(s)) continue;
+      _historyLoading.add(s);
+      try {
+        await _fetchSkipped(s, 0, 1 << 30);
+      } finally {
+        _historyLoading.remove(s);
+      }
     }
   }
 
@@ -1285,7 +1403,10 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
 
     // A gap in a text stream's message ids: fetch what was skipped first.
     final messageId = _toInt(json['message_id']);
-    if (!skipped && messageId != null && sender.isNotEmpty && !RegExp(r'^(tts|lip)').hasMatch(sender)) {
+    if (!skipped && messageId != null && _historyLoading.contains(sender)) {
+      // Its whole history is on the way already.
+      if (messageId > (_senderIds[sender] ?? -1)) _senderIds[sender] = messageId;
+    } else if (!skipped && messageId != null && sender.isNotEmpty && !RegExp(r'^(tts|lip)').hasMatch(sender)) {
       final last = _senderIds[sender];
       if (last == null || messageId > last + 1) {
         _senderIds[sender] = messageId;
@@ -1293,6 +1414,13 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
       } else if (messageId > last) {
         _senderIds[sender] = messageId;
       }
+    }
+
+    // Mic state (START_AUDIO / PAUSE / speech & music signals): banner only.
+    if (_audioState.apply(json, fromHistory: skipped)) {
+      final kind = _audioState.banner?.kind;
+      if (mounted) setState(() => _lastBannerKind = kind);
+      if (json['seq'] == null && json['text'] == null) return;
     }
 
     // Headings, paragraph breaks, summaries, notes → the document view.
@@ -1588,6 +1716,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
     _sseSubscription = null;
     _audioPlayer.dispose();
     _ttsCompleteSub?.cancel();
+    _bannerTimer?.cancel();
     _ttsPlayer.dispose();
     _scrollController.dispose();
     _httpClient.close();
@@ -1781,6 +1910,7 @@ class _LiveTranscriptScreenState extends State<LiveTranscriptScreen> {
                       spokenToken: spokenPart?.key,
                       onParagraphTap: _partsFor(docLanguage).isEmpty ? null : _onParagraphTap,
                       fontSize: _fontSize,
+                      footer: _buildAudioBanner(docLanguage),
                     )
                   : filteredKeys.isEmpty
                   ? Center(
