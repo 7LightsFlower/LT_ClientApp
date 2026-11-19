@@ -1052,6 +1052,7 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
                       ),
                       title: Text(
                         item.name,
+                        maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(fontWeight: FontWeight.w500),
                       ),
@@ -1065,6 +1066,9 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
                           ),
                         ],
                       ),
+                      isThreeLine: true,
+                      // Two narrow columns of buttons (share | edit over
+                      // delete) leave more room for the session name.
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
@@ -1072,16 +1076,25 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
                             icon: const Icon(Icons.share, size: 20),
                             onPressed: () => _showLanguageDialog(item.url),
                             tooltip: 'Share as PDF',
+                            visualDensity: VisualDensity.compact,
                           ),
-                          IconButton(
-                            icon: const Icon(Icons.edit, size: 20),
-                            onPressed: () => _editName(index),
-                            tooltip: 'Edit name',
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.close, size: 20),
-                            onPressed: () => _deleteSession(index),
-                            tooltip: 'Remove',
+                          Column(
+                            mainAxisSize: MainAxisSize.min,
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              IconButton(
+                                icon: const Icon(Icons.edit, size: 20),
+                                onPressed: () => _editName(index),
+                                tooltip: 'Edit name',
+                                visualDensity: VisualDensity.compact,
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.delete_outline, size: 20),
+                                onPressed: () => _deleteSession(index),
+                                tooltip: 'Remove',
+                                visualDensity: VisualDensity.compact,
+                              ),
+                            ],
                           ),
                         ],
                       ),
