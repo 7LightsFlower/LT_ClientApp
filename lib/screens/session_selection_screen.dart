@@ -433,13 +433,7 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
     }
   }
 
-  // ---------- Delete ----------
-  void _deleteSession(int index) {
-    final newList = List<SessionHistoryItem>.from(_history);
-    newList.removeAt(index);
-    _saveHistory(newList);
-  }
-
+  // ---------- Delete (tick the sessions, then the delete button on top) ----------
   void _toggleSelection(int index) {
     setState(() {
       if (_selectedIndices.contains(index)) {
@@ -1046,9 +1040,14 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
                     final item = _history[index];
                     final isSelected = _selectedIndices.contains(index);
                     return ListTile(
+                      // Narrow margins and gaps: more room for the name.
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+                      horizontalTitleGap: 4,
+                      minLeadingWidth: 0,
                       leading: Checkbox(
                         value: isSelected,
                         onChanged: (_) => _toggleSelection(index),
+                        visualDensity: VisualDensity.compact,
                       ),
                       title: Text(
                         item.name,
@@ -1067,10 +1066,12 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
                         ],
                       ),
                       isThreeLine: true,
-                      // Two narrow columns of buttons (share | edit over
-                      // delete) leave more room for the session name.
-                      trailing: Row(
+                      // One narrow column (share over edit) leaves the
+                      // most room for the name. Delete: tick the session(s)
+                      // and use the delete button at the top.
+                      trailing: Column(
                         mainAxisSize: MainAxisSize.min,
+                        mainAxisAlignment: MainAxisAlignment.center,
                         children: [
                           IconButton(
                             icon: const Icon(Icons.share, size: 20),
@@ -1078,23 +1079,11 @@ class _SessionSelectionScreenState extends State<SessionSelectionScreen>
                             tooltip: 'Share as PDF',
                             visualDensity: VisualDensity.compact,
                           ),
-                          Column(
-                            mainAxisSize: MainAxisSize.min,
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              IconButton(
-                                icon: const Icon(Icons.edit, size: 20),
-                                onPressed: () => _editName(index),
-                                tooltip: 'Edit name',
-                                visualDensity: VisualDensity.compact,
-                              ),
-                              IconButton(
-                                icon: const Icon(Icons.delete_outline, size: 20),
-                                onPressed: () => _deleteSession(index),
-                                tooltip: 'Remove',
-                                visualDensity: VisualDensity.compact,
-                              ),
-                            ],
+                          IconButton(
+                            icon: const Icon(Icons.edit, size: 20),
+                            onPressed: () => _editName(index),
+                            tooltip: 'Edit name',
+                            visualDensity: VisualDensity.compact,
                           ),
                         ],
                       ),
