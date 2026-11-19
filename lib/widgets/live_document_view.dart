@@ -23,7 +23,11 @@ class LiveDocumentView extends StatefulWidget {
     this.spokenToken,
     this.onParagraphTap,
     this.fontSize = 17,
+    this.footer,
   });
+
+  /// Shown after the last output (the mic state banner).
+  final Widget? footer;
 
   /// Size of the running text (A− / A+).
   final double fontSize;
@@ -74,7 +78,12 @@ class _LiveDocumentViewState extends State<LiveDocumentView> {
   Widget build(BuildContext context) {
     final content = widget.content;
     if (content.isEmpty) {
-      return Center(child: Text(widget.emptyText));
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [Text(widget.emptyText), if (widget.footer != null) widget.footer!],
+        ),
+      );
     }
     final theme = Theme.of(context);
     final dark = theme.brightness == Brightness.dark;
@@ -239,6 +248,8 @@ class _LiveDocumentViewState extends State<LiveDocumentView> {
       ));
       if (open) children.addAll(sec.body.map(blockWidget));
     }
+
+    if (widget.footer != null) children.add(widget.footer!);
 
     return SelectionArea(
       child: ListView(
